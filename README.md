@@ -18,7 +18,7 @@ The pipeline expects the [Gigawork dataset (MSR'24)](https://doi.org/10.1145/364
 unpacked at the project root:
 
 ```
-/your_folder/cicd/
+/your_folder/WorkflowFix/
 ├── workflows.csv           # 1.5 GB index: one row per (commit, workflow file) pair
 └── workflows/              # ~3M content-addressed YAML blobs, named by file_hash
 ```

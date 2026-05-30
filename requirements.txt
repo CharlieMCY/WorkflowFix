@@ -2,3 +2,7 @@ polars>=1.0
 PyYAML>=6.0
 tqdm>=4.66
 zizmor>=1.20
+
+# backport_gaps/ — GitHub API client + .env loader
+requests>=2.31
+python-dotenv>=1.0

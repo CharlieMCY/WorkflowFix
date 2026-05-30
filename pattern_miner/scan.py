@@ -85,14 +85,16 @@ def finding_id(f: dict) -> tuple[str, str]:
 # --- single-blob scan --------------------------------------------------------
 
 
-def scan_one(file_hash: str, blobs_dir: Path = BLOBS_DIR, timeout: int = 30) -> dict:
-    """Run zizmor on one blob via stdin. Returns the record to write to scans.jsonl."""
-    blob_path = blobs_dir / file_hash
-    try:
-        text = blob_path.read_bytes()
-    except FileNotFoundError:
-        return {"file_hash": file_hash, "ok": False, "error": "blob missing"}
+def scan_bytes(content: bytes, timeout: int = 30) -> dict:
+    """Run zizmor on an in-memory YAML byte string.
 
+    Returns:
+        {"ok": True,  "findings": [<normalized finding>, ...]}     on success
+        {"ok": False, "error": "..."}                              on failure
+
+    Used by both scan_one (reads from BLOBS_DIR) and the backport_gaps module
+    (fetches blobs over the GitHub API).
+    """
     try:
         proc = subprocess.run(
             [
@@ -103,28 +105,36 @@ def scan_one(file_hash: str, blobs_dir: Path = BLOBS_DIR, timeout: int = 30) -> 
                 "-q",
                 "-",
             ],
-            input=text,
+            input=content,
             capture_output=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return {"file_hash": file_hash, "ok": False, "error": "timeout"}
+        return {"ok": False, "error": "timeout"}
 
-    # exit 1 = hard error; everything else either has [] or [findings...]
     if proc.returncode == _ERROR_EXIT_CODE:
-        return {"file_hash": file_hash, "ok": False,
+        return {"ok": False,
                 "error": (proc.stderr or b"").decode("utf-8", "replace")[:200]}
 
     try:
         raw = json.loads(proc.stdout or b"[]")
     except json.JSONDecodeError as e:
-        return {"file_hash": file_hash, "ok": False, "error": f"json: {e}"}
+        return {"ok": False, "error": f"json: {e}"}
 
-    return {
-        "file_hash": file_hash,
-        "ok": True,
-        "findings": [_normalize_finding(f) for f in raw],
-    }
+    return {"ok": True, "findings": [_normalize_finding(f) for f in raw]}
+
+
+def scan_one(file_hash: str, blobs_dir: Path = BLOBS_DIR, timeout: int = 30) -> dict:
+    """Run zizmor on one local blob (BLOBS_DIR/<file_hash>). Returns scans.jsonl row."""
+    blob_path = blobs_dir / file_hash
+    try:
+        text = blob_path.read_bytes()
+    except FileNotFoundError:
+        return {"file_hash": file_hash, "ok": False, "error": "blob missing"}
+
+    res = scan_bytes(text, timeout=timeout)
+    res["file_hash"] = file_hash
+    return res
 
 
 # --- batch scan --------------------------------------------------------------

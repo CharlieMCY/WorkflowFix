@@ -163,6 +163,176 @@ output/
 }
 ```
 
+## Backport-gap audit (separate module)
+
+[`backport_gaps/`](backport_gaps/) is a separate module that consumes
+`output/clean_fixes/` (produced by `pattern_miner`) and, for each clean-fix
+commit on a project's default branch, audits the project's release-style
+branches via the GitHub API to find ones where the fixed zizmor finding is
+**still present**. These are the backporting opportunities.
+
+### Setup (GitHub token via `.env`)
+
+```bash
+cp .env.example .env
+# edit .env and set:
+#   GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+```
+
+A fine-grained PAT with read-only access to public repositories is enough.
+`.env` is gitignored; the token is never written elsewhere.
+
+### Run
+
+```bash
+# Audit every clean-fix commit (uses output/clean_fixes/*/meta.json as input)
+.venv/bin/python -m backport_gaps find-gaps
+
+# Summarize the resulting gaps.jsonl
+.venv/bin/python -m backport_gaps summary
+```
+
+Smoke test with a small subset first:
+
+```bash
+.venv/bin/python -m backport_gaps find-gaps --limit 10
+```
+
+### What it does, per clean-fix commit C in repo R on file F
+
+1. Confirm C is on R's default-branch history (else skip).
+2. List R's branches, keep only release-style names (`release/*`, `v1.x`,
+   `stable`, `maintenance/*`, etc.).
+3. For each release branch B:
+   - Fetch F at B's HEAD via the GitHub Contents API.
+   - If absent, mark inapplicable.
+   - Otherwise zizmor-scan it. Match the SET of `ident`s C fixed against the
+     set of `ident`s still present on B. (Strict `(ident, route)` matching
+     was tried first and discarded — release-branch YAML diverges
+     structurally, so routes almost never line up; ident-set matching is the
+     defensible criterion.)
+4. Classify each branch as `gap` (any ident still present),
+   `already_fixed` (none present), or `inapplicable` (no such file).
+
+### Classifying `already_fixed` further — history scan + lag
+
+`already_fixed` conflates two genuinely different cases: the release branch
+truly backported C's fix at some commit, versus the release branch never
+had the vulnerability in the first place (different code path, file added
+later, etc.). To split them, `classify-history` walks the file's history on
+each `already_fixed` branch via the GitHub commits API:
+
+- For each historical commit of F on B (up to `MAX_HISTORY_COMMITS=10`),
+  fetch the file and zizmor-scan it.
+- Find the boundary commit where the master-fixed idents transition from
+  present to absent. That commit's date is the backport date; `lag_days =
+  backport_date - master_commit_date`.
+
+Final post-hoc refinement by lag sign:
+
+- `lag > +1 day`  → `true_backport`           (release applied master's fix later)
+- `|lag| <= 1`    → `same_day_fix`            (likely a merge from master, not a deliberate backport)
+- `lag < -1 day`  → `independent_prior_fix`   (release fixed independently before master)
+
+Per-record time-budget (`PER_RECORD_TIMEOUT_S = 8 min`) and history cap keep
+worst-case audit time bounded. Anything beyond becomes `inconclusive` /
+`timed_out`.
+
+```bash
+.venv/bin/python -m backport_gaps classify-history
+.venv/bin/python -m backport_gaps history-summary
+```
+
+### Output layout
+
+```
+output/backport_gaps/
+├── gaps.jsonl                  # one row per clean-fix commit (gap audit)
+└── gaps_with_history.jsonl     # gap audit + per-branch history classification
+```
+
+One row schema (abbreviated):
+
+```json
+{
+  "repository": "...",
+  "commit_hash": "...",
+  "default_branch": "main",
+  "status": "ok",
+  "V_fixed_idents": ["unpinned-uses", "excessive-permissions"],
+  "target_files": [".github/workflows/release.yml"],
+  "gap_branches": [
+    {
+      "branch": "release/2.x",
+      "branch_head_sha": "...",
+      "V_present_idents": ["unpinned-uses"],
+      "n_findings_present": 5,
+      "files": [{"file_path": "...", "status": "ok",
+                 "n_findings_present_from_master_fix": 5}]
+    }
+  ],
+  "already_fixed_branches": [...],
+  "inapplicable_branches": [...]
+}
+```
+
+`status` values: `ok`, `not_on_default`, `repo_error`, `compare_error`,
+`branches_error` — non-`ok` rows are kept so failure modes can be quantified.
+
+## Analysis scripts
+
+[`analysis/`](analysis/) holds the standalone analysis scripts used to derive
+the numbers we report. Each script is independent, reads from `output/`, and
+prints to stdout — no figures, no API calls, no side effects. They are the
+authoritative source for the numbers; the per-CLI `summary` subcommands are
+deliberately compact and don't show all of these.
+
+| Script | What it reports |
+|---|---|
+| [`01_clean_fix_filter_comparison.py`](analysis/01_clean_fix_filter_comparison.py) | Commit counts under strict vs. three looser definitions of "clean fix" |
+| [`02_pattern_distribution.py`](analysis/02_pattern_distribution.py) | All level-1 buckets, `|V_fixed_idents|` size breakdown, sub-cluster uniqueness ratio |
+| [`03_match_eval.py`](analysis/03_match_eval.py) | Match outcome on an out-of-sample 2 000-commit pull (`seed=99`): full / level-1 / miss |
+| [`04_gap_audit_drill.py`](analysis/04_gap_audit_drill.py) | Per-commit gap distribution, long tail, per-ident gap counts, repo coverage, mirror-commit stats |
+| [`05_history_lag_drill.py`](analysis/05_history_lag_drill.py) | Refined backport status (true / same-day / independent / inconclusive / never / timed-out), lag distribution, full TRUE-backport list, 1-3 month cluster drill |
+| [`06_zizmor_rule_cross_tab.py`](analysis/06_zizmor_rule_cross_tab.py) | Per-rule commit counts, top rule co-occurrence, rule × backport-status table, rule × gap-presence table |
+
+Run any one:
+
+```bash
+.venv/bin/python -m analysis.05_history_lag_drill
+```
+
+### Headline numbers (10k sample)
+
+These are reproducible by re-running the scripts above on the current `output/`:
+
+| Metric | Value | Source |
+|---|---|---|
+| Clean-fix commits (`V_fixed != ∅` ∧ `V_introduced == ∅`) | 364 | 01 |
+| Pattern buckets / structural sub-clusters | 43 / 346 | 02 |
+| Out-of-sample match: level-1 hit | 95.6% (65/68) | 03 |
+| Out-of-sample match: level-2 (structural) hit | 1.5% (1/68) | 03 |
+| Audited release branches | 2 546 across 364 commits | 04 |
+| Gap pairs (release branch still has the rule) | **835** | 04 |
+| Commits with ≥1 gap | 101 (27.7%) | 04 |
+| `already_fixed` branches passed to history scan | 472 | 05 |
+| **TRUE backports** (`lag > 1 day`) | **27** | 05 |
+| Same-day "fixes" (likely merge sync from master) | 118 | 05 |
+| Independent prior fix on release | 6 | 05 |
+| Inconclusive (mostly `history_cap_reached`) | 256 | 05 |
+
+### Important caveat on the TRUE backport count
+
+`05_history_lag_drill` exposes that 17 of the 27 TRUE backports belong to a
+single master commit on `hyperledger/besu` (one fix replayed on 17 release
+branches with ~51-day lag). So the dataset has only **about 7 distinct
+master commits** with a confirmed real backport, distributed across:
+`hyperledger/besu`, `kumahq/kuma`, `kubernetes/minikube`, `stac-utils/rustac`,
+`assertj/assertj`, `apache/camel-quarkus`, `bitwarden/sdk*`, `matplotlib/matplotlib`.
+The 27 vs 7 gap is purely from counting per-(commit, branch) pair rather than
+per-master-commit; both ways of counting are valid but mean different things
+and must be reported explicitly.
+
 ## Caveats
 
 - **Step-index drift**: zizmor's finding routes use raw list indices. Inserting

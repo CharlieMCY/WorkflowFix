@@ -279,6 +279,127 @@ One row schema (abbreviated):
 `status` values: `ok`, `not_on_default`, `repo_error`, `compare_error`,
 `branches_error` — non-`ok` rows are kept so failure modes can be quantified.
 
+## Backport-IR patch generation (`backport_ir/`)
+
+[`backport_ir/`](backport_ir/) closes the loop: it frames the fix task as
+**backporting** and turns each master clean-fix into an executable,
+drift-tolerant patch that can be replayed onto a release branch where the gap is
+still open. It is a self-built semantic-patch engine (no ast-grep / Semgrep): a
+master commit's `(before -> after)` diff is *compiled* into an `IRProgram` of
+anchored, idempotent edits, then *applied* to a structurally drifted target.
+
+**Why an IR, not a line patch.** A release branch's YAML has diverged, so a
+textual patch won't apply. The IR locates each edit by YAML *semantic identity*
+— the job is a `$JOB` metavariable, steps are matched by `uses=`/`id=`/`name=` —
+the same identity keying `extract_diff` already uses, which absorbs reordering
+and unrelated insertions.
+
+Three ops, one per diff bucket:
+
+```
+ensure_present   key must exist with value     (from diff.added)
+ensure_absent    key must not exist            (from diff.removed)
+rewrite_value    value must become X / a pin   (from diff.changed)
+```
+
+Edits are **idempotent ensures**, not imperative hunks, so replaying onto a
+partially-fixed branch converges (the same state-based philosophy as the gap
+audit). A `uses:` tag->SHA change compiles to a `pin()` that resolves to the
+*target's* current ref — zero version bump, since a security backport must not
+smuggle a feature upgrade; an unresolved pin becomes `needs_review`, never a
+guess.
+
+**Verification is two-layered, on purpose:**
+- *runtime* (cheap, no scanner): structural post-conditions assert each applied
+  edit actually landed in the patched text — "did the edit land" is structurally
+  decidable, so re-scanning here would be redundant.
+- *eval* (the zizmor oracle): rescan `(target-before, patched)` and require the
+  target idents to disappear with `V_introduced == ∅` — pattern_miner's
+  clean-fix criterion, reused as automated acceptance. This is what engine
+  accuracy is reported against; it is NOT run per patch.
+
+### Run
+
+```bash
+# offline smoke test — needs no Gigawork data, no GitHub, no zizmor
+.venv/bin/python -m backport_ir selfcheck
+
+# compile clean-fix commits into .wsp programs (output/backport_ir/programs/)
+.venv/bin/python -m backport_ir compile [--limit N]
+
+# apply one program to a LOCAL target workflow (offline)
+.venv/bin/python -m backport_ir apply <program.wsp> <target.yml>
+
+# replay onto every still-open release-branch gap (needs GITHUB_TOKEN; --oracle adds zizmor)
+.venv/bin/python -m backport_ir backport [--limit N] [--oracle]
+```
+
+`apply`/`backport` need `ruamel.yaml` (format-preserving round-trip, so a PR
+carries only the intended diff). The oracle and `backport` reuse
+`pattern_miner.scan` and `backport_gaps`' GitHub client respectively.
+
+### Try it on the bundled example
+
+[`backport_ir/examples/`](backport_ir/examples/) has a self-contained clean-fix
+you can run by hand — no Gigawork dataset needed. Its master commit hardens one
+workflow three ways (`{artipacked, excessive-permissions, unpinned-uses}`), plus
+a drifted release-branch file to replay the patch onto:
+
+```bash
+# compile the example clean-fix into a .wsp patch
+.venv/bin/python -m backport_ir compile \
+    --clean-fixes backport_ir/examples/clean_fixes --out /tmp/wsp
+cat /tmp/wsp/*.wsp
+
+# apply that patch to the drifted release-branch file
+.venv/bin/python -m backport_ir apply \
+    "$(ls /tmp/wsp/*.wsp | grep -v index)" \
+    backport_ir/examples/target-release-branch.yml --out /tmp/patched
+cat /tmp/patched/target-release-branch.yml.patched
+```
+
+`persist-credentials: false` and a top-level `permissions:` block get added on
+the drifted target (`$JOB` binds the renamed job; `checkout` is matched despite
+being the 2nd step; comments are preserved). The pin is left `needs_review`
+offline, since it needs a GitHub SHA resolver.
+
+### The patch format is WSP (a semantic patch, not JSON)
+
+A compiled program is stored — and read back — as a Coccinelle/SmPL-style
+**Workflow Semantic Patch** (`.wsp`). There is no JSON form of a program:
+`compile` writes `.wsp`, `apply`/`backport` read it, so the on-disk artifact is
+the very thing a human reviews or hand-edits.
+
+```
+@@
+# source: github/codeql-action@<sha> .github/workflows/post-release-mergeback.yml
+fixes excessive-permissions
+metavariable job $JOB
+@@
+
+jobs.$JOB.permissions
++ contents: write
++ pull-requests: write
+```
+
+`+ k: v` = ensure_present, `- k` = ensure_absent, a `-`/`+` pair = rewrite_value
+(a pinned `uses:` shows as `@<sha: pin target_ref>`); edits that still need a
+human appear in a trailing `# needs review` block. `wsp.to_wsp`/`from_wsp`
+round-trip, so a hand-edited patch parses straight back into an executable IR.
+(Run reports and the program index stay JSON — they're diagnostics, not the IR.)
+
+The full grammar — EBNF, lexical tokens, op derivation, IR mapping — is in
+[`backport_ir/GRAMMAR.md`](backport_ir/GRAMMAR.md).
+
+### Current limits
+
+- A new *top-level* key (e.g. an added `permissions:` block) is appended at
+  end-of-file — semantically correct, but not position-matched to the source.
+- Adding/removing a whole list element (e.g. inserting a new step) is deferred;
+  such edits compile but are flagged `needs_review`.
+- Pin resolution needs a GitHub-backed resolver; offline, pins are
+  `needs_review`.
+
 ## Analysis scripts
 
 [`analysis/`](analysis/) holds the standalone analysis scripts used to derive

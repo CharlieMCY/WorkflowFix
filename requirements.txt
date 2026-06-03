@@ -6,3 +6,6 @@ zizmor>=1.20
 # backport_gaps/ — GitHub API client + .env loader
 requests>=2.31
 python-dotenv>=1.0
+
+# backport_ir/ — format-preserving YAML round-trip for patch generation
+ruamel.yaml>=0.18

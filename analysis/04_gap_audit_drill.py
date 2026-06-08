@@ -72,9 +72,33 @@ def main() -> None:
     repos_with_gap = set(r["repository"] for r in ok if r["gap_branches"])
     repos_with_af = set(r["repository"]
                         for r in ok if r["already_fixed_branches"])
-    print(f"unique repos audited:                  {len(repos_all)}")
-    print(f"unique repos with at least one gap:    {len(repos_with_gap)}")
-    print(f"unique repos with prior backport:      {len(repos_with_af)}")
+    repos_with_both = repos_with_gap & repos_with_af
+    repos_with_either = repos_with_gap | repos_with_af
+    repos_with_neither = repos_all - repos_with_either
+    n_all = len(repos_all)
+
+    def pct(n): return f"{100*n/max(n_all,1):>5.1f}%"
+
+    print(f"unique repos audited:                  {n_all:>4}")
+    print(f"  with at least one gap:               {len(repos_with_gap):>4}  ({pct(len(repos_with_gap))})")
+    print(f"  with prior backport (already_fixed): {len(repos_with_af):>4}  ({pct(len(repos_with_af))})")
+    print(f"  with both gap AND already_fixed:     {len(repos_with_both):>4}  ({pct(len(repos_with_both))})")
+    print(f"  with either (any backport activity): {len(repos_with_either):>4}  ({pct(len(repos_with_either))})")
+    print(f"  with neither (no actionable signal): {len(repos_with_neither):>4}  ({pct(len(repos_with_neither))})")
+
+    # Per affected-repo: gap density
+    if repos_with_gap:
+        per_repo_gap = {}
+        for r in ok:
+            if r["gap_branches"]:
+                per_repo_gap[r["repository"]] = per_repo_gap.get(r["repository"], 0) + len(r["gap_branches"])
+        total_gap_in_affected = sum(per_repo_gap.values())
+        print()
+        print(f"of the {len(repos_with_gap)} repos with at least one gap:")
+        print(f"  total gap branches:          {total_gap_in_affected}")
+        print(f"  avg gap branches / repo:     {total_gap_in_affected / len(repos_with_gap):>5.1f}")
+        print(f"  max gap branches in one repo: {max(per_repo_gap.values())}"
+              f"  ({max(per_repo_gap, key=per_repo_gap.get)})")
 
     # Mirror commits
     print()

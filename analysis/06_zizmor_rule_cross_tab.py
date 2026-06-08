@@ -69,15 +69,20 @@ def main() -> None:
                     per_ident[s][ident] += 1
 
     print()
-    print("=== rule × backport status (each row = #branches per rule) ===")
+    print("=== rule × backport status (each row = #already_fixed branches per rule) ===")
+    print("    rightmost two columns: row total, then % that are TRUE backport")
     all_rules = sorted(rule_commit_count.keys())
     headers = ("true", "sameday", "indep", "inconcl", "never", "timeout")
     keys = ("true_backport", "same_day_fix", "independent_prior_fix",
             "inconclusive", "never_had_it", "timed_out")
-    print(f'  {"ident":>26}  ' + "  ".join(f"{h:>8}" for h in headers))
+    print(f'  {"ident":>26}  ' + "  ".join(f"{h:>8}" for h in headers)
+          + f"  {'total':>6}  {'true%':>6}")
     for r in all_rules:
         vals = [per_ident[k][r] for k in keys]
-        print(f"  {r:>26}  " + "  ".join(f"{v:>8}" for v in vals))
+        total = sum(vals)
+        true_pct = (vals[0] / total * 100) if total else 0
+        print(f"  {r:>26}  " + "  ".join(f"{v:>8}" for v in vals)
+              + f"  {total:>6}  {true_pct:>5.1f}%")
 
     # 3. cross-tab against gap presence (from gaps.jsonl)
     gap_per_ident: Counter[str] = Counter()

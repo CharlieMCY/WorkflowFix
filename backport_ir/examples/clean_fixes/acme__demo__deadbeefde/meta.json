@@ -1,0 +1,22 @@
+{
+  "repository": "acme/demo",
+  "commit_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  "github_url": "https://github.com/acme/demo/commit/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  "V_fixed_count": 3,
+  "V_fixed_idents": ["artipacked", "excessive-permissions", "unpinned-uses"],
+  "n_files_modified": 1,
+  "files": [
+    {
+      "file_path": ".github/workflows/ci.yml",
+      "before": ".github__workflows__ci.before.yml",
+      "after": ".github__workflows__ci.after.yml",
+      "scan_status": "ok",
+      "V_fixed": [
+        {"ident": "artipacked", "route": "jobs.build.steps[0]", "severity": "Medium"},
+        {"ident": "excessive-permissions", "route": "jobs.build", "severity": "Medium"},
+        {"ident": "unpinned-uses", "route": "jobs.build.steps[0]", "severity": "High"}
+      ],
+      "V_introduced": []
+    }
+  ]
+}

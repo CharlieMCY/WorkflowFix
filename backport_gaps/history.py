@@ -25,6 +25,11 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,13 +43,16 @@ from .github import GitHubClient, GitHubError
 
 
 # How many historical versions of a file we'll scan per branch before giving
-# up. 10 catches almost all "recent backport" events (which is what we care
-# about) while bounding the API budget to ~10 fetches per branch.
-MAX_HISTORY_COMMITS = 10
+# up. Raised from 10 to 50 to recover the `inconclusive` cohort whose
+# backport event landed deeper in the branch's file history.
+MAX_HISTORY_COMMITS = 50
 
-# Time budget per master commit. Heavy repos (40+ release branches) can
-# otherwise grind for >30 minutes on a single record; we cap and move on.
-PER_RECORD_TIMEOUT_S = 8 * 60
+# Time budget per master commit. With per-record branch concurrency the wall
+# clock is roughly (#branches / #workers) × per-branch-time. At 50k scale,
+# under variable network conditions, 8 min wasn't enough for ~50 heavy
+# records (40+ branches each). Raised to 16 min for the retry pass.
+PER_RECORD_TIMEOUT_S = 16 * 60
+MAX_WORKERS_PER_RECORD = 8
 
 
 def _days_between(t_master: str, t_backport: str) -> float:
@@ -161,16 +169,51 @@ def _summarize_branch(history_classifications: list[dict]) -> dict:
     return branch
 
 
+def _classify_one_branch(
+    client: GitHubClient,
+    repo: str,
+    branch: str,
+    target_files: list[str],
+    target_idents: set[str],
+    master_date: str | None,
+    max_commits: int,
+) -> list[dict[str, Any]]:
+    """Per-branch worker: walk every target_file's history on this branch.
+
+    Used as the unit of concurrency inside `run`. requests.Session is
+    thread-safe for concurrent GETs, so multiple instances of this function
+    share the same `client` across threads safely.
+    """
+    per_file: list[dict[str, Any]] = []
+    for path in target_files:
+        try:
+            cls = find_backport_event(
+                client, repo, branch, path,
+                target_idents, master_date,
+                max_commits=max_commits,
+            )
+        except GitHubError as e:
+            cls = {"status": "error", "error": str(e)[:200]}
+        cls["file_path"] = path
+        per_file.append(cls)
+    return per_file
+
+
 def run(
     in_path: Path | None = None,
     out_path: Path | None = None,
     limit: int | None = None,
+    max_workers: int = MAX_WORKERS_PER_RECORD,
 ) -> Path:
     """Walk file history for each already_fixed branch and confirm/timestamp the backport.
 
     Resume-safe: if `out_path` already exists, rows whose (repository, commit_hash)
     pair is already present are skipped. This lets a killed/restarted run pick up
     where it left off without re-doing the expensive ones.
+
+    Within each master commit, the per-branch history walks run on a
+    ThreadPoolExecutor (default 8 workers). This is the main lever that lets
+    heavy commits (40+ release branches) finish within the per-record budget.
     """
     in_path = in_path or (GAPS_DIR / "gaps.jsonl")
     out_path = out_path or (GAPS_DIR / "gaps_with_history.jsonl")
@@ -222,25 +265,61 @@ def run(
             master_date = master_date_cache[key]
             rec["master_commit_date"] = master_date
 
-            for br in rec["already_fixed_branches"]:
-                if time.time() - t_start > PER_RECORD_TIMEOUT_S:
+            # Per-branch concurrency. ThreadPoolExecutor wraps the per-branch
+            # history walks; as_completed yields each branch's result as it
+            # finishes. The (deadline-style) timeout on as_completed bounds
+            # total wait — if it fires, unfinished futures are marked timed_out.
+            executor = ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="hist"
+            )
+            try:
+                futures = {
+                    executor.submit(
+                        _classify_one_branch,
+                        client, repo, br["branch"], target_files,
+                        target_idents, master_date, MAX_HISTORY_COMMITS,
+                    ): br
+                    for br in rec["already_fixed_branches"]
+                }
+                remaining = dict(futures)
+
+                try:
+                    for fut in as_completed(futures, timeout=PER_RECORD_TIMEOUT_S):
+                        br = remaining.pop(fut, None)
+                        if br is None:
+                            continue
+                        try:
+                            per_file = fut.result()
+                        except Exception as e:
+                            per_file = [{
+                                "status": "error",
+                                "error": f"{type(e).__name__}: {str(e)[:200]}",
+                                "file_path": "?",
+                            }]
+                        br["history_classifications"] = per_file
+                        br.update(_summarize_branch(per_file))
+                except FuturesTimeoutError:
                     timed_out = True
-                    br["history_classifications"] = []
-                    br["backport_status"] = "timed_out"
-                    continue
-                per_file = []
-                for path in target_files:
-                    try:
-                        cls = find_backport_event(
-                            client, repo, br["branch"], path,
-                            target_idents, master_date,
-                        )
-                    except GitHubError as e:
-                        cls = {"status": "error", "error": str(e)[:200]}
-                    cls["file_path"] = path
-                    per_file.append(cls)
-                br["history_classifications"] = per_file
-                br.update(_summarize_branch(per_file))
+                    # When `as_completed` raises, futures that had already
+                    # finished but weren't yielded are still in `remaining`.
+                    # Collect their results — only mark truly-unfinished
+                    # futures as timed_out.
+                    for fut, br in remaining.items():
+                        if fut.done():
+                            try:
+                                per_file = fut.result(timeout=0)
+                                br["history_classifications"] = per_file
+                                br.update(_summarize_branch(per_file))
+                            except Exception:
+                                br["history_classifications"] = []
+                                br["backport_status"] = "timed_out"
+                        else:
+                            br["history_classifications"] = []
+                            br["backport_status"] = "timed_out"
+            finally:
+                # cancel_futures=True drops queued futures that haven't started;
+                # running threads finish naturally (Python can't kill threads).
+                executor.shutdown(wait=False, cancel_futures=True)
 
             rec["record_timed_out"] = timed_out
             rec["record_duration_s"] = round(time.time() - t_start, 1)

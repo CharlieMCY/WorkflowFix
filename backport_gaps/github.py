@@ -76,6 +76,12 @@ class GitHubClient:
             if r.status_code in (502, 503, 504):
                 time.sleep(2 ** attempt)
                 continue
+            if r.status_code == 401 and attempt < 3:
+                # Token is valid (verified separately), so 401 here is
+                # transient — possibly a brief auth-cache desync on the
+                # GitHub side. Back off and try again.
+                time.sleep(2 ** attempt)
+                continue
             raise GitHubError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
         raise GitHubError(f"GET {url} exhausted retries")
 

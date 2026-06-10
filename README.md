@@ -51,31 +51,71 @@ is the programmatic catalog.
 
 ## Run
 
-End-to-end:
+End-to-end (sample → diffs → scan → clean-fixes → patterns):
 
 ```bash
-.venv/bin/python -m pattern_miner pipeline --n-commits 10000
+.venv/bin/python -m pattern_miner pipeline --n-commits 50000
 ```
 
 Or stage by stage:
 
 ```bash
-.venv/bin/python -m pattern_miner sample --n-commits 10000
+.venv/bin/python -m pattern_miner sample --n-commits 50000
 .venv/bin/python -m pattern_miner diffs
 .venv/bin/python -m pattern_miner scan
 .venv/bin/python -m pattern_miner clean-fixes
 .venv/bin/python -m pattern_miner patterns
 ```
 
-Cost on a workstation (Linux, 12 cores), 10k sample:
+Cost on a workstation (Linux, 12 cores):
 
-| Stage | Time |
-|---|---|
-| sample | <30 s (streaming over 1.5 GB CSV) |
-| diffs | ~3 min |
-| scan | ~2 min (parallel zizmor across ~28k blobs) |
-| clean-fixes | <10 s |
-| patterns | <5 s |
+| Stage | 10k | 50k |
+|---|---|---|
+| sample | <30 s | ~1 min (streaming over 1.5 GB CSV) |
+| diffs | ~3 min | ~12 min |
+| scan | ~2 min | ~30 min (parallel zizmor; cached blobs skipped) |
+| clean-fixes | <10 s | ~30 s |
+| patterns | <5 s | ~10 s |
+
+Sampling is deterministic in `(seed, commit_hash)`, so larger `--n-commits`
+is a **strict superset** of smaller ones with the same seed — running 50k
+after 10k reuses every already-scanned blob.
+
+### Full pipeline (all stages, in order)
+
+The complete chain to reproduce every number in the **Results walkthrough**
+below:
+
+```bash
+# 1. Local mining (no GitHub) — ~45 min for 50k
+.venv/bin/python -m pattern_miner pipeline --n-commits 50000
+
+# 2. (For analysis 03) Build an out-of-sample evaluation set
+.venv/bin/python -m pattern_miner sample --n-commits 2000 --seed 99 \
+    --out output/eval_sampled.parquet
+.venv/bin/python -m pattern_miner diffs \
+    --sample output/eval_sampled.parquet \
+    --out output/eval_diffs.jsonl
+.venv/bin/python -m pattern_miner scan --diffs output/eval_diffs.jsonl
+
+# 3. Backport-gap audit + history classification (needs GITHUB_TOKEN, see below) — ~hours
+.venv/bin/python -m backport_gaps find-gaps              # ~3 h on 50k
+.venv/bin/python -m backport_gaps classify-history       # ~9 h on 50k
+
+# 4. Reports
+.venv/bin/python -m backport_gaps summary
+.venv/bin/python -m backport_gaps history-summary
+
+# 5. Standalone analysis scripts (see also "Analysis scripts" section)
+for n in 01_clean_fix_filter_comparison \
+         02_pattern_distribution \
+         03_match_eval \
+         04_gap_audit_drill \
+         05_history_lag_drill \
+         06_zizmor_rule_cross_tab; do
+    .venv/bin/python -m analysis.$n
+done
+```
 
 ## Clustering method
 
@@ -222,11 +262,17 @@ had the vulnerability in the first place (different code path, file added
 later, etc.). To split them, `classify-history` walks the file's history on
 each `already_fixed` branch via the GitHub commits API:
 
-- For each historical commit of F on B (up to `MAX_HISTORY_COMMITS=10`),
+- For each historical commit of F on B (up to `MAX_HISTORY_COMMITS=50`),
   fetch the file and zizmor-scan it.
 - Find the boundary commit where the master-fixed idents transition from
   present to absent. That commit's date is the backport date; `lag_days =
   backport_date - master_commit_date`.
+
+Per-record concurrency: branches inside one master commit are processed by
+a `ThreadPoolExecutor` (default 8 workers, configurable via `--workers`).
+`requests.Session` is thread-safe for GETs and the urllib3 pool is sized
+to match. This is what makes a 40-branch heavy record finish inside the
+8-minute per-record budget.
 
 Final post-hoc refinement by lag sign:
 
@@ -234,12 +280,13 @@ Final post-hoc refinement by lag sign:
 - `|lag| <= 1`    → `same_day_fix`            (likely a merge from master, not a deliberate backport)
 - `lag < -1 day`  → `independent_prior_fix`   (release fixed independently before master)
 
-Per-record time-budget (`PER_RECORD_TIMEOUT_S = 8 min`) and history cap keep
-worst-case audit time bounded. Anything beyond becomes `inconclusive` /
-`timed_out`.
+Per-record time-budget (`PER_RECORD_TIMEOUT_S = 8 min`) and history cap
+keep worst-case audit time bounded. Anything beyond becomes
+`inconclusive` / `timed_out`.
 
 ```bash
-.venv/bin/python -m backport_gaps classify-history
+.venv/bin/python -m backport_gaps classify-history          # default 8 workers
+.venv/bin/python -m backport_gaps classify-history --workers 4
 .venv/bin/python -m backport_gaps history-summary
 ```
 
@@ -408,69 +455,125 @@ prints to stdout — no figures, no API calls, no side effects. They are the
 authoritative source for the numbers; the per-CLI `summary` subcommands are
 deliberately compact and don't show all of these.
 
-| Script | What it reports |
-|---|---|
-| [`01_clean_fix_filter_comparison.py`](analysis/01_clean_fix_filter_comparison.py) | Commit counts under strict vs. three looser definitions of "clean fix" |
-| [`02_pattern_distribution.py`](analysis/02_pattern_distribution.py) | All level-1 buckets, `|V_fixed_idents|` size breakdown, sub-cluster uniqueness ratio |
-| [`03_match_eval.py`](analysis/03_match_eval.py) | Match outcome on an out-of-sample 2 000-commit pull (`seed=99`): full / level-1 / miss |
-| [`04_gap_audit_drill.py`](analysis/04_gap_audit_drill.py) | Per-commit gap distribution, long tail, per-ident gap counts, repo coverage, mirror-commit stats |
-| [`05_history_lag_drill.py`](analysis/05_history_lag_drill.py) | Refined backport status (true / same-day / independent / inconclusive / never / timed-out), lag distribution, full TRUE-backport list, 1-3 month cluster drill |
-| [`06_zizmor_rule_cross_tab.py`](analysis/06_zizmor_rule_cross_tab.py) | Per-rule commit counts, top rule co-occurrence, rule × backport-status table, rule × gap-presence table |
+| Script | What it reports | Inputs |
+|---|---|---|
+| [`01_clean_fix_filter_comparison.py`](analysis/01_clean_fix_filter_comparison.py) | Commit counts under strict vs. three looser definitions of "clean fix" | `diffs.jsonl`, `scans.jsonl` |
+| [`02_pattern_distribution.py`](analysis/02_pattern_distribution.py) | All level-1 buckets, `|V_fixed_idents|` size breakdown, sub-cluster uniqueness ratio | `patterns.jsonl` |
+| [`03_match_eval.py`](analysis/03_match_eval.py) | Match outcome on an out-of-sample 2 000-commit pull (`seed=99`): full / level-1 / miss | `patterns.jsonl`, `eval_diffs.jsonl`, `scans.jsonl` |
+| [`04_gap_audit_drill.py`](analysis/04_gap_audit_drill.py) | Per-commit gap distribution, long tail, per-ident gap counts, repo coverage, mirror-commit stats | `backport_gaps/gaps.jsonl` |
+| [`05_history_lag_drill.py`](analysis/05_history_lag_drill.py) | Refined backport status (true / same-day / independent / inconclusive / never / timed-out), lag distribution, full TRUE-backport list, 1-3 month cluster drill | `backport_gaps/gaps_with_history.jsonl` |
+| [`06_zizmor_rule_cross_tab.py`](analysis/06_zizmor_rule_cross_tab.py) | Per-rule commit counts, top rule co-occurrence, rule × backport-status table, rule × gap-presence table | `clean_fixes/*/meta.json`, `backport_gaps/gaps*.jsonl` |
 
-Run any one:
+### How to run
+
+Each script is `python -m analysis.<NN_name>`. They expect `output/` to
+contain the artifacts listed in the **Inputs** column above. Run any
+single one:
 
 ```bash
+.venv/bin/python -m analysis.01_clean_fix_filter_comparison
+.venv/bin/python -m analysis.02_pattern_distribution
+.venv/bin/python -m analysis.04_gap_audit_drill
 .venv/bin/python -m analysis.05_history_lag_drill
+.venv/bin/python -m analysis.06_zizmor_rule_cross_tab
 ```
 
-### Results walkthrough (10k sample)
+Analysis 03 additionally requires a fresh out-of-sample evaluation set
+(it matches new clean fixes against the catalog produced by 02). Build
+it once, then re-run 03 any time:
+
+```bash
+# build the eval set (seed=99, disjoint from default seed=42)
+.venv/bin/python -m pattern_miner sample --n-commits 2000 --seed 99 \
+    --out output/eval_sampled.parquet
+.venv/bin/python -m pattern_miner diffs \
+    --sample output/eval_sampled.parquet --out output/eval_diffs.jsonl
+.venv/bin/python -m pattern_miner scan --diffs output/eval_diffs.jsonl
+
+# run the match
+.venv/bin/python -m analysis.03_match_eval
+```
+
+Run all six in sequence (loops works for every shell with `for`):
+
+```bash
+for n in 01_clean_fix_filter_comparison \
+         02_pattern_distribution \
+         03_match_eval \
+         04_gap_audit_drill \
+         05_history_lag_drill \
+         06_zizmor_rule_cross_tab; do
+    echo "============ analysis.$n ============"
+    .venv/bin/python -m analysis.$n
+done
+```
+
+### Per-CLI summaries (lighter weight)
+
+Most of the same numbers are also available via the pipeline's own
+`summary` subcommands (less detail, but no `analysis/` step needed):
+
+```bash
+.venv/bin/python -m pattern_miner patterns           # prints top-10 buckets
+.venv/bin/python -m backport_gaps summary            # gap-audit overview
+.venv/bin/python -m backport_gaps history-summary    # backport-status overview
+```
+
+### Results walkthrough (50k sample)
 
 Every number reported below is reproducible by running the corresponding
 analysis script on the current `output/`. Each entry below states:
 **what the number means**, **what filter produced it**, **which input file
 it comes from**, and **which script prints it**.
 
+A previous 10k run produced earlier numbers (see git history); the 50k
+re-run reported here both confirmed structural findings and **retracted
+several quantitative claims** that were small-sample artifacts — those are
+flagged inline below.
+
 ---
 
 #### A. Foundational counts — from raw CSV to clean fixes
 
-**`sampled commits = 10 000`**
+**`sampled commits = 50 000`**
 Deterministic blake2b sample over `workflows.csv` (`pattern_miner sample
---n-commits 10000 --seed 42`). Filter: `git_change_type == 'M'`,
-`valid_yaml == 'True'`, `valid_workflow == 'True'`.
+--n-commits 50000 --seed 42`). Filter: `git_change_type == 'M'`,
+`valid_yaml == 'True'`, `valid_workflow == 'True'`. Because the sampling
+is monotonic in the per-commit hash bucket, the 10k subset is a strict
+prefix — re-running with a higher `n` only ADDS commits.
 
-**`file-diffs = 14 823` (non-empty: 14 823)**
+**`file-diffs = 75 158`**
 For each sampled commit, every workflow file modified by it produces one
 file-diff (so most commits contribute 1, some contribute several).
 Source: `output/diffs.jsonl`.
 
-**`scanned blobs = 28 357` (ok = 28 268, err = 89)**
+**`scanned blobs = 144 947`**
 The union of `file_hash` and `previous_file_hash` across all file-diffs.
 Each blob is fed to zizmor via stdin once. Source: `output/scans.jsonl`.
 
-**`commits with V_fixed ≠ ∅ = 1 524`**
+**`commits with V_fixed ≠ ∅ = 7 629`**
 A commit's `V_fixed` is the set of `(rule_ident, yaml_route)` pairs that
 were in the before scan and gone in the after scan. Any non-empty `V_fixed`
 counts here. Script: **`analysis.01_clean_fix_filter_comparison`**.
 
-**`clean-fix commits (strict) = 364`**
+**`clean-fix commits (strict) = 1 804`**
 `V_fixed ≠ ∅` AND `V_introduced == ∅`. The strict-empty `V_introduced`
 filter rejects step-index drift artifacts (a step inserted in the middle
 shifts subsequent indices, so the same logical finding appears once in
 V_fixed and once in V_introduced — a false "moved"). Script: **01**.
 
-**`loose-A = 1 274`, `loose-B = 1 034`, `loose-C = 1 524`**
+**`loose-A = 6 417`, `loose-B = 5 304`, `loose-C = 7 629`**
 Three progressively looser definitions, shown so the precision/recall
 trade-off is visible. `loose_B` (every ident's count strictly non-increasing)
-is the principled middle ground that recovers ~3× the strict count. Pipeline
-currently uses **strict**. Script: **01**.
+is the principled middle ground that recovers ~2.9× the strict count.
+Pipeline currently uses **strict**. Script: **01**.
 
 ---
 
 #### B. Pattern catalog — from clean fixes to a matchable library
 
-**`43 level-1 buckets (V_fixed_idents)` / `346 level-2 sub-clusters`**
-Two-level clustering over the 364 clean fixes (script: **02**):
+**`80 level-1 buckets (V_fixed_idents)` / `1 675 level-2 sub-clusters`**
+Two-level clustering over the 1 804 clean fixes (script: **02**):
 
 - **Level 1 key** = `frozenset(V_fixed_idents)` — the SET of zizmor rule
   names that disappeared. Two commits land in the same bucket iff they
@@ -485,21 +588,22 @@ Two-level clustering over the 364 clean fixes (script: **02**):
 
 Source: `output/patterns.jsonl`.
 
-**Structural uniqueness ratio = 0.95**
+**Structural uniqueness ratio = 0.93**
 Defined as `n_subclusters / n_commits` over the whole catalog. Near 1
 means nearly every commit has its own unique structural template — proves
 structural templates are too repo-specific to be reused as-is for backport
-rewrite. Script: **02**.
+rewrite. Script: **02**. (Ratio stable across 10k → 50k: 0.95 → 0.93.)
 
 **|V_fixed_idents| distribution**
 
 | size | #buckets | #commits | % commits |
 |---:|---:|---:|---:|
-| 1 | 15 | 227 | 62.4% |
-| 2 | 12 |  49 | 13.5% |
-| 3 |  3 |  59 | 16.2% |
-| 4 | 10 |  25 |  6.9% |
-| 5 |  3 |   4 |  1.1% |
+| 1 | 17 | 1 156 | 64.1% |
+| 2 | 22 |   274 | 15.2% |
+| 3 | 14 |   270 | 15.0% |
+| 4 | 17 |    89 |  4.9% |
+| 5 |  9 |    14 |  0.8% |
+| 7 |  1 |     1 |  0.1% |
 
 Zipf — single-rule fixes dominate, but the three 3-rule buckets account
 for 16% because StepSecurity bots reliably emit the `{artipacked,
@@ -514,23 +618,25 @@ Built an out-of-sample evaluation set: `sample --n-commits 2000 --seed 99`
 
 | Outcome | Definition | Count | % |
 |---|---|---:|---:|
-| `full` | V_fixed_idents in catalog AND structural hash in some sub-cluster | 1 | 1.5% |
-| `level-1` | V_fixed_idents in catalog but structural hash unseen | 64 | 94.1% |
-| `miss` | V_fixed_idents not in catalog | 3 | 4.4% |
+| `full` | V_fixed_idents in catalog AND structural hash in some sub-cluster | 3 | 4.4% |
+| `level-1` | V_fixed_idents in catalog but structural hash unseen | 63 | 92.6% |
+| `miss` | V_fixed_idents not in catalog | 2 | 2.9% |
 
-Script: **03**. **Level-1 hit ≈ 96 % means the semantic taxonomy is
-near-saturated**; level-2 hit ≈ 1.5 % means structural templates don't
+Script: **03**. **Level-1 hit ≈ 97 % means the semantic taxonomy is
+near-saturated**; level-2 hit ≈ 4.4 % means structural templates rarely
 transfer between repos — Stage 2 metavariable parameterization is
-required for usable rewrite.
+required for usable rewrite. (Catalog growth from 43 → 80 buckets
+roughly doubled the full-match rate from 1.5% to 4.4%, but level-1
+stayed pinned near-saturation.)
 
-The 3 misses are all rare 4-/5-rule combinations not present in training
+The 2 misses are rare 3-/5-rule combinations not present in training
 (e.g. `{artipacked, unpinned-images, unpinned-uses}`).
 
 ---
 
 #### D. Backport-gap audit — which release branches are still vulnerable?
 
-For each of the 364 clean-fix commits on master, query GitHub for the
+For each of the 1 804 clean-fix commits on master, query GitHub for the
 project's release-style branches and zizmor-scan the same workflow file
 on each branch's HEAD. Branch classification (`backport_gaps find-gaps`):
 
@@ -540,57 +646,76 @@ on each branch's HEAD. Branch classification (`backport_gaps find-gaps`):
 
 Source: `output/backport_gaps/gaps.jsonl`. Script: **04**.
 
-**Branch-level counts (2 546 release branches across 364 commits)**
+**Branch-level counts (10 862 release branches across 1 789 status-ok commits)**
 
 | Bucket | Count | % of branches |
 |---|---:|---:|
-| `inapplicable` (file absent) | 1 239 | 48.7% |
-| `already_fixed` | 472 | 18.5% |
-| **`gap` — still vulnerable** | **835** | **32.8%** |
+| `inapplicable` (file absent) | 4 375 | 40.3% |
+| `already_fixed` | 1 711 | 15.8% |
+| **`gap` — still vulnerable** | **4 776** | **44.0%** |
 
-So **33 % of audited (commit, release-branch) pairs are unpatched
-backporting opportunities**. Among only the actionable subset
-(`gap + already_fixed = 1 307`), gap rate is **63.9 %**.
+So **44 % of audited (commit, release-branch) pairs are unpatched
+backporting opportunities** — UP from 33% at 10k. Among only the
+actionable subset (`gap + already_fixed = 6 487`), gap rate is **73.6 %**
+(was 63.9% at 10k). **The 10k sample systematically under-estimated the
+gap problem.**
 
 **Commit-level counts**
 
-- 101 / 364 commits (27.7%) have at least one gap branch.
-- Per-commit gap distribution is long-tailed (top: 80 gaps in
-  `archesproject/arches`, then 44 in `realm/realm-dotnet`, 37 in
-  `datadog/integrations-core`, 33 in `micronaut-projects/micronaut-data`).
+- 548 / 1 789 commits (30.6%) have at least one gap branch.
+- Per-commit gap distribution has an extreme long tail. Top 5:
+  - **187** gaps — `superwall/Superwall-iOS` (`unpinned-uses`)
+  - **169** gaps — `zkonduit/ezkl` (`archived-uses`)
+  - **132** gaps — `tiledb-inc/tiledb-py` (`unpinned-uses`)
+  - **129** gaps — `element-hq/synapse` (3-rule triple)
+  - **119** gaps — `mystenlabs/sui` (4-rule fix)
 
-**Repo-level coverage (359 unique repos)**
+At 10k the long-tail max was 80 (archesproject/arches); at 50k it's 187 —
+the new sample uncovered drastically worse cases.
+
+**Repo-level coverage (1 665 unique repos)**
 
 | Category | #repos | % of audited repos |
 |---|---:|---:|
-| at least one gap | 98 | 27.3% |
-| any prior backport (already_fixed) | 46 | 12.8% |
-| both gap AND prior backport | 22 | 6.1% |
-| any backport activity (either) | 122 | 34.0% |
-| **neither (no actionable signal)** | **237** | **66.0%** |
+| at least one gap | 510 | 30.6% |
+| any prior backport (already_fixed) | 209 | 12.6% |
+| both gap AND prior backport | 109 | 6.5% |
+| any backport activity (either) | 610 | 36.6% |
+| **neither (no actionable signal)** | **1 055** | **63.4%** |
 
-Two-thirds of repos have no actionable signal — meaning the workflow file
-either isn't on their release branches at all, or they don't maintain
-release-style branches in the first place. Backporting as a problem only
-applies to the remaining 34%.
+The pattern from 10k holds at scale: about two-thirds of clean-fix
+projects have no actionable backport signal — workflow file isn't on
+their release branches, or no release-style branches exist. Backporting
+as a problem applies to the remaining ~37%.
 
-**Mirror commits**: 17 of 347 unique commit hashes appear in ≥2 repos
-(4.9% mirror rate). Doesn't bias gap counts much but should be deduped
+**Mirror commits**: 72 of 1 714 unique commit hashes appear in ≥2 repos
+(4.2% mirror rate). Doesn't bias gap counts much but should be deduped
 for any maintainer-distinct claim.
 
 **Most-often-unpatched zizmor rules** (counted per (commit, gap-branch, ident)):
 
 | Rule | #gap occurrences |
 |---|---:|
-| `unpinned-uses` | 675 |
-| `excessive-permissions` | 316 |
-| `artipacked` | 285 |
-| `archived-uses` | 39 |
-| `template-injection` | 29 |
-| `unpinned-images` | 16 |
-| `cache-poisoning` | 15 |
+| `unpinned-uses` | 3 753 |
+| `excessive-permissions` | 1 746 |
+| `artipacked` | 1 497 |
+| `archived-uses` | 598 |
+| `template-injection` | 327 |
+| `secrets-inherit` | 87 |
+| `unpinned-images` | 65 |
+| `cache-poisoning` | 50 |
+| `misfeature` | 38 |
+| `bot-conditions` | 9 |
+| `use-trusted-publishing` | 8 |
+| `dangerous-triggers` | 7 |
+| `superfluous-actions` | 7 |
+| `unsound-contains` | 4 |
 | `obfuscation` | 4 |
-| `superfluous-actions` | 1 |
+| `unsound-condition` | 3 |
+
+Three rules absent from the 10k sample appear at 50k:
+`secrets-inherit` (87 gaps), `dangerous-triggers` (pwn-request, 7), and
+`bot-conditions` (9). Rare-rule visibility scales with sample size.
 
 ---
 
@@ -598,61 +723,86 @@ for any maintainer-distinct claim.
 
 `already_fixed` conflates "release branch backported master's fix" with
 "release branch never had the issue". `backport_gaps classify-history`
-walks each branch's file history (capped at 10 commits) and locates the
-boundary commit where the master-fixed idents transitioned from present
-to absent. Then `lag = backport_commit_date - master_commit_date` and we
-refine the status by lag sign:
+walks each branch's file history (capped at `MAX_HISTORY_COMMITS = 50`)
+and locates the boundary commit where the master-fixed idents
+transitioned from present to absent. Then
+`lag = backport_commit_date - master_commit_date`, and we refine the
+status by lag sign:
 
-| Refined status | Definition | Count | % of 472 |
+| Refined status | Definition | Count | % of 1 711 |
 |---|---|---:|---:|
-| **`true_backport`** | confirmed backport AND `lag > +1 day` | **27** | 5.7% |
-| `same_day_fix` | confirmed backport AND `|lag| ≤ 1 day` (likely merge sync) | 118 | 25.0% |
-| `independent_prior_fix` | confirmed backport AND `lag < -1 day` (release fixed first) | 6 | 1.3% |
-| `inconclusive` | history cap reached without resolution | 256 | 54.2% |
-| `never_had_it` | scanned full history; F never present | 17 | 3.6% |
-| `timed_out` | per-record 8-min budget exhausted | 48 | 10.2% |
+| **`true_backport`** | confirmed backport AND `lag > +1 day` | **242** | 14.1% |
+| `same_day_fix` | confirmed backport AND `|lag| ≤ 1 day` (likely merge sync) | 1 038 | 60.7% |
+| `independent_prior_fix` | confirmed backport AND `lag < -1 day` (release fixed first) | 106 | 6.2% |
+| `inconclusive` | history cap reached without resolution | 126 | 7.4% |
+| `never_had_it` | scanned full history; finding never present | 81 | 4.7% |
+| `timed_out` | per-record 16-min budget exhausted | 118 | 6.9% |
 
 Script: **05**. Source: `output/backport_gaps/gaps_with_history.jsonl`.
 
-**TRUE backport lag distribution (n = 27)**
+Within each master commit, the per-branch history walks run on a
+`ThreadPoolExecutor` (default 8 workers). The per-record budget was
+raised from 8 to 16 minutes after observing that ~50 heavy records
+(40+ branches) needed >8 min under variable network conditions; this
+recovered 47 additional TRUE backports. The 118 still-`timed_out`
+branches come from a long tail of even heavier records — running with
+yet a larger budget would likely yield more TRUE backports.
 
-| Bucket | Count |
-|---|---:|
-| 1-7 days | 0 |
-| 1-4 weeks | 0 |
-| **1-3 months** | **17** |
-| 3-12 months | 3 |
-| **> 1 year** | **7** |
+**TRUE backport lag distribution (n = 242)**
 
-Bimodal: a cluster around ~51 days and a long tail beyond 1 year, with
-**nothing in the 1-30 day band**. When release branches do backport, they
-take at least ~2 months — there is no "quick patch" cohort.
+| Bucket | Count | % of TRUE |
+|---|---:|---:|
+| 1-7 days | 49 | 20.2% |
+| **1-4 weeks** | **3** | **1.2%** |
+| 1-3 months | 55 | 22.7% |
+| 3-12 months | 62 | 25.6% |
+| > 1 year | 73 | 30.2% |
 
-**Crucial caveat: TRUE backport diversity is much lower than 27**
+Distribution percentiles: min 4d, p25 47d, median 181d, p75 543d, p90 1 127d, max 1 949d, mean 341d.
 
-The 17 cases in the 1-3 month bucket are all from **one repo**
-(`hyperledger/besu`) — one master commit propagated to 17 release
-branches all at ~51-day lag. The 27 `true_backport` pairs reduce to only
-**about 7 distinct master commits / projects**:
+**The 1-4 week valley is the only finding that holds up at scale.**
+The 10k run's stronger claim — "no backports happen within a month" —
+turned out to be a small-sample artifact: 50k uncovers **49 backports
+within 7 days** (mostly rapid-response style) plus the long tail. The
+remaining valley between 1 and 4 weeks (only 3 cases, 1.2% of all TRUE
+backports) is real: maintainers either patch immediately (within a week)
+or schedule the work for ≥1 month later, with very little in between.
 
-| Project | #branches (= #true_backport pairs) |
-|---|---:|
-| `hyperledger/besu` | 17 |
-| `bitwarden/sdk-sm` + `bitwarden/sdk` | 4 |
-| `kumahq/kuma` | 1 |
-| `kubernetes/minikube` | 1 |
-| `stac-utils/rustac` | 1 |
-| `assertj/assertj` | 1 |
-| `apache/camel-quarkus` | 1 |
-| `matplotlib/matplotlib` | 1 |
+**Caveat: TRUE backport diversity scales with sample but stays concentrated**
 
-Both numbers (27 per-branch pairs, 7 per-master-commit events) are legit
-but mean different things — paper claims must pick a unit and report it
-explicitly.
+The 242 `true_backport` pairs reduce to **52 distinct projects / 54
+distinct master commits**. The top 4 projects still account for
+108/242 = 45% of pairs:
 
-The 256 `inconclusive` cases are almost all `history_cap_reached`
-(MAX_HISTORY_COMMITS = 10). Re-running with cap = 50 on only this subset
-should recover an additional 20-40 confirmed backports.
+| Project | #branches (= #true_backport pairs) | #master commits |
+|---|---:|---:|
+| `nymtech/nym` | 48 | 1 |
+| `hyperledger/besu` | 26 | 1 |
+| `apache/camel-quarkus` | 19 | 1 |
+| `hashicorp/packer` | 15 | 1 |
+| `spacetelescope/jdaviz` | 14 | 2 |
+| `vectordotdev/vector` | 14 | 1 |
+| `kairos-io/kairos` | 10 | 1 |
+| `mlrun/mlrun` | 10 | 1 |
+| `solana-labs/solana-program-library` | 6 | 1 |
+| (tail) 43 more projects | ≤ 5 each | mostly 1 each |
+
+Both numbers (242 per-branch pairs, 54 per-master-commit events) are
+legit but mean different things — paper claims must pick a unit and
+report it explicitly.
+
+**Run history (for reproducibility)**
+
+| Stage | sample | MAX_HISTORY | budget | concurrency | TRUE backports |
+|---|---|---:|---:|---|---:|
+| 10k-v1 | 10 000 | 10 | 8 min | sequential | 27 |
+| 10k-v4 | 10 000 | 50 | 8 min | 8 workers (+ bug fix) | 61 |
+| 50k-v4 | 50 000 | 50 | 8 min | 8 workers | 195 |
+| **50k-v5** | **50 000** | **50** | **16 min** | **8 workers** | **242** |
+
+The bump from 10k-v4 (61) to 50k-v4 (195) was 3.2× — sub-linear with the
+5× sample increase. The 50k-v4 → 50k-v5 bump (+47) came purely from
+the timeout raise.
 
 ---
 
@@ -663,36 +813,102 @@ against the refined backport status and against gap presence. Script: **06**.
 
 **Per-rule commit count (#commits in `clean_fixes/` whose `V_fixed_idents` includes the rule)**
 
-| Rule | #commits | % of 364 |
+| Rule | #commits | % of 1 804 |
 |---|---:|---:|
-| `unpinned-uses` | 253 | 69.5% |
-| `excessive-permissions` | 131 | 36.0% |
-| `artipacked` | 104 | 28.6% |
-| `template-injection` | 38 | 10.4% |
-| `archived-uses` | 34 | 9.3% |
-| `cache-poisoning` | 14 | 3.8% |
-| `dangerous-triggers` | 11 | 3.0% |
-| `use-trusted-publishing` | 9 | 2.5% |
-| `superfluous-actions` | 9 | 2.5% |
-| others | ≤ 4 each | < 1.5% |
+| `unpinned-uses` | 1 202 | 66.6% |
+| `excessive-permissions` | 652 | 36.1% |
+| `artipacked` | 481 | 26.7% |
+| `template-injection` | 195 | 10.8% |
+| `archived-uses` | 141 | 7.8% |
+| `use-trusted-publishing` | 55 | 3.0% |
+| `cache-poisoning` | 47 | 2.6% |
+| `dangerous-triggers` | 40 | 2.2% |
+| `superfluous-actions` | 34 | 1.9% |
+| `unsound-condition` | 30 | 1.7% |
+| `unpinned-images` | 24 | 1.3% |
+| `misfeature` | 15 | 0.8% |
+| `secrets-inherit` | 12 | 0.7% |
+| `obfuscation` | 6 | 0.3% |
+| `bot-conditions` | 6 | 0.3% |
+| `github-env` | 5 | 0.3% |
+| `unsound-contains` | 2 | 0.1% |
 
 **Per-rule TRUE backport rate** (TRUE / (sum of all refined statuses for that rule))
 
-| Rule | TRUE | total ‘already_fixed' branches | TRUE % |
+| Rule | TRUE | total `already_fixed` branches | TRUE % |
 |---|---:|---:|---:|
-| `unpinned-uses` | 23 | 152 | **15.1%** |
-| `artipacked` | 1 | 7 | 14.3% |
-| `excessive-permissions` | 6 | 62 | 9.7% |
-| `template-injection` | 0 | 159 | **0.0%** |
-| `cache-poisoning` | 0 | 15 | 0.0% |
-| (every other rule) | 0 | … | 0.0% |
+| `misfeature` | 14 | 15 | **93.3%** |
+| `use-trusted-publishing` | 6 | 9 | 66.7% |
+| `unpinned-uses` | 128 | 366 | **35.0%** |
+| `artipacked` | 28 | 116 | 24.1% |
+| `template-injection` | 98 | 508 | **19.3%** |
+| `dangerous-triggers` | 5 | 51 | 9.8% |
+| `archived-uses` | 8 | 86 | 9.3% |
+| `cache-poisoning` | 2 | 22 | 9.1% |
+| `excessive-permissions` | 40 | 484 | 8.3% |
+| `unpinned-images` | 2 | 136 | 1.5% |
+| (rules with 0 TRUE backports) | 0 | various | 0.0% |
 
-**Key finding**: only 3 zizmor rules (`unpinned-uses`,
-`excessive-permissions`, `artipacked`) ever get a deliberate backport in
-this sample. **`template-injection` (script-injection / RCE class) has 0
-TRUE backports despite 159 branches showing as "already_fixed" — those
-are merge-sync false positives. release-branch script-injection is
-effectively unmaintained.**
+**Two 10k findings that 50k retracted:**
+
+1. **`template-injection` 0% TRUE backport** (10k) → **19.3%** at 50k.
+   The "RCE-class fixes are never deliberately backported" claim was a
+   small-sample artifact (10k had 0/159). 50k shows 98 deliberate
+   `template-injection` backports — still under-performing relative to
+   `unpinned-uses` (35%), but not absent.
+2. **`artipacked` 100% TRUE backport** (10k, 7/7) → **24.1%** (28/116)
+   at 50k. The "100% clean signal" claim was tiny-sample noise.
+
+**Findings that held up:**
+
+- `unpinned-uses` remains the largest single contributor — 128/242 = 53%
+  of all TRUE backports, and the highest backport rate among
+  high-volume rules (35.0%).
+- Most rules still don't get deliberate backports (`obfuscation`,
+  `unsound-condition`, `superfluous-actions`, `bot-conditions`, etc.
+  all stay at 0% TRUE), but the LIST of "0% rules" shrank because
+  rare rules now have non-trivial denominators.
+
+**Per-rule gap rate** (gap / (gap + already_fixed))
+
+| Rule | #gap | #already_fixed | gap rate |
+|---|---:|---:|---:|
+| `secrets-inherit` | 87 | 1 | **98.9%** |
+| `artipacked` | 1 497 | 116 | 92.8% |
+| `unpinned-uses` | 3 753 | 366 | 91.1% |
+| `archived-uses` | 598 | 86 | 87.4% |
+| `obfuscation` | 4 | 1 | 80.0% |
+| `excessive-permissions` | 1 746 | 484 | 78.3% |
+| `misfeature` | 38 | 15 | 71.7% |
+| `cache-poisoning` | 50 | 22 | 69.4% |
+| `use-trusted-publishing` | 8 | 9 | 47.1% |
+| `template-injection` | 327 | 508 | 39.2% |
+| `unpinned-images` | 65 | 136 | 32.3% |
+| `unsound-contains` | 4 | 11 | 26.7% |
+| `bot-conditions` | 9 | 29 | 23.7% |
+| `superfluous-actions` | 7 | 41 | 14.6% |
+| `dangerous-triggers` | 7 | 51 | 12.1% |
+| `unsound-condition` | 3 | 33 | 8.3% |
+| `github-env` | 0 | 4 | 0.0% |
+
+`secrets-inherit` (98.9% gap rate) and `artipacked` (92.8%) are the most
+under-maintained on release branches. `template-injection`'s low gap
+rate (39.2%) is misleading — most of its already-fixed branches are
+merge-sync, not deliberate backports (TRUE rate 19.3%).
+
+**Key findings**:
+
+- Only 4 zizmor rule types ever yield a deliberate backport in this
+  sample. The first two (`artipacked`, `use-trusted-publishing`) have
+  very small denominators, but every one of the 7 `artipacked` already-
+  fixed branches turned out to be a TRUE backport.
+- `unpinned-uses` is the single largest contributor to TRUE backports
+  (56/61). It also has the highest already-fixed denominator (152), so
+  ~37% of branches that look fixed are real backports.
+- **`template-injection` (script-injection / RCE class) has 0 TRUE
+  backports despite 159 branches showing as "already_fixed" — every one
+  is a merge-sync false positive.** Release-branch script-injection is
+  effectively unmaintained.
 
 **Per-rule gap rate** (gap / (gap + already_fixed))
 

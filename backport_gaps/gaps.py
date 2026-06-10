@@ -170,6 +170,12 @@ def run(
     metas: Iterable[Path] | None = None,
     limit: int | None = None,
 ) -> Path:
+    """Audit each clean-fix commit's release branches.
+
+    Resume-safe: if `out_path` already exists, rows whose
+    (repository, commit_hash) pair is already present are skipped. Lets a
+    killed run (network blip, token rotation, etc.) pick up cleanly.
+    """
     out_path = out_path or (GAPS_DIR / "gaps.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -180,9 +186,24 @@ def run(
     if limit is not None:
         metas = metas[:limit]
 
-    with out_path.open("w", encoding="utf-8") as fp:
+    # Build skip set from existing output (resume).
+    done: set[tuple[str, str]] = set()
+    if out_path.exists():
+        with out_path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                try:
+                    r = json.loads(line)
+                    done.add((r["repository"], r["commit_hash"]))
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        print(f"resume: skipping {len(done)} already-processed records")
+
+    with out_path.open("a", encoding="utf-8") as fp:
         for meta_path in tqdm(metas, desc="audit"):
             meta = json.loads(meta_path.read_text())
+            key = (meta["repository"], meta["commit_hash"])
+            if key in done:
+                continue
             rec = find_gap_for_commit(client, meta)
             fp.write(json.dumps(rec, ensure_ascii=False))
             fp.write("\n")

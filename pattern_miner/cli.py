@@ -212,7 +212,9 @@ def cmd_match(args):
 
 def cmd_pipeline(args):
     """Run all five stages end-to-end."""
-    cmd_sample(args)
+    cmd_sample(argparse.Namespace(
+        n_commits=args.n_commits, seed=args.seed, out=None,
+    ))
     cmd_diffs(argparse.Namespace(sample=None, out=None))
     cmd_scan(argparse.Namespace(diffs=None, out=None, workers=args.workers))
     cmd_clean_fixes(argparse.Namespace(diffs=None, scans=None, out=None))

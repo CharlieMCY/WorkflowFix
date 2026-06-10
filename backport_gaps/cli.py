@@ -25,7 +25,12 @@ def cmd_summary(args):
 
 
 def cmd_classify_history(args):
-    out = run_history(in_path=args.gaps, out_path=args.out, limit=args.limit)
+    out = run_history(
+        in_path=args.gaps,
+        out_path=args.out,
+        limit=args.limit,
+        max_workers=args.workers,
+    )
     print(f"history-classified gaps -> {out}")
 
 
@@ -60,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output JSONL (default: output/backport_gaps/gaps_with_history.jsonl)")
     sp.add_argument("--limit", type=int, default=None,
                     help="only process the first N gaps.jsonl rows (smoke test)")
+    sp.add_argument("--workers", type=int, default=8,
+                    help="per-record branch concurrency (default 8)")
     sp.set_defaults(func=cmd_classify_history)
 
     sp = sub.add_parser("history-summary",

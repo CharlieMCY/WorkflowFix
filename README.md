@@ -356,14 +356,39 @@ audit). A `uses:` tag->SHA change compiles to a `pin()` that resolves to the
 smuggle a feature upgrade; an unresolved pin becomes `needs_review`, never a
 guess.
 
-**Verification is two-layered, on purpose:**
-- *runtime* (cheap, no scanner): structural post-conditions assert each applied
-  edit actually landed in the patched text — "did the edit land" is structurally
-  decidable, so re-scanning here would be redundant.
-- *eval* (the zizmor oracle): rescan `(target-before, patched)` and require the
-  target idents to disappear with `V_introduced == ∅` — pattern_miner's
-  clean-fix criterion, reused as automated acceptance. This is what engine
-  accuracy is reported against; it is NOT run per patch.
+**Verification is layered, with a hard distinction between engine self-tests
+and external oracles:**
+
+- *Engine self-tests* (development / QA — NOT a paper-grade correctness signal):
+  `check_postconditions` re-parses the patched YAML and asserts each landed
+  edit's target state actually holds. Catches apply-engine bugs ("I said I
+  wrote it but it isn't there") but it cannot tell you whether the patch
+  fixes the vulnerability or keeps the workflow working — only that the
+  engine kept its word. Useful for catching regressions when changing the
+  apply engine; never reported as a success rate.
+- *External oracles* (the only judgments that don't know about backport_ir):
+  three independent checks run on `(target-before, patched)`:
+  - **`zizmor_local`** (headline): for every landed edit, the workflow-scope
+    surrounding that edit (its enclosing step, or job, or root) must end up
+    free of the rule master targeted, and must not introduce any new finding
+    within that same scope. Honestly answers "did the construct master tried
+    to fix on master also get fixed on the release-branch corresponding
+    construct?" — without penalising the patch for findings at unrelated
+    sites the master commit never addressed.
+  - **`zizmor_global`** (loose upper bound, kept for contrast): symmetric to
+    pattern_miner's clean-fix criterion — at least one targeted rule reduced
+    anywhere on the release branch, nothing new introduced. Will mark a
+    correctly-applied backport as failure whenever the release branch has
+    independent instances of the same rule that master never touched, so
+    it should be reported alongside `zizmor_local` to surface the gap, not
+    in place of it.
+  - **`actionlint`**: workflow still lints cleanly — no new actionlint
+    findings introduced relative to `target-before`. Strongest static proxy
+    for "the workflow still works at the GitHub-Actions-schema level"; we
+    do not actually execute the patched workflow.
+  A backport is treated as paper-claim-correct iff `zizmor_local` AND
+  `actionlint` both pass. The combined verdict is what evaluation should
+  report; the engine self-tests stay internal.
 
 ### Run
 
@@ -377,13 +402,23 @@ guess.
 # apply one program to a LOCAL target workflow (offline)
 .venv/bin/python -m backport_ir apply <program.wsp> <target.yml>
 
-# replay onto every still-open release-branch gap (needs GITHUB_TOKEN; --oracle adds zizmor)
+# replay onto every still-open release-branch gap (needs GITHUB_TOKEN)
+# --oracle additionally runs all three external oracles per pair
 .venv/bin/python -m backport_ir backport [--limit N] [--oracle]
 ```
 
 `apply`/`backport` need `ruamel.yaml` (format-preserving round-trip, so a PR
-carries only the intended diff). The oracle and `backport` reuse
-`pattern_miner.scan` and `backport_gaps`' GitHub client respectively.
+carries only the intended diff). `--oracle` additionally needs `actionlint`
+(installed as `actionlint-py` in `requirements.txt`). The oracle and
+`backport` reuse `pattern_miner.scan` and `backport_gaps`' GitHub client
+respectively. With `--oracle`, `cmd_backport` prints per-oracle counts:
+
+```
+zizmor global:      N    (target rule reduced anywhere on release; loose)
+zizmor local:       N    (target construct fixed at the master-targeted site)
+actionlint:         N    (no new lint findings)
+zizmor_local AND actionlint: N  (headline: paper-claim-correct)
+```
 
 ### Try it on the bundled example
 
@@ -438,14 +473,33 @@ round-trip, so a hand-edited patch parses straight back into an executable IR.
 The full grammar — EBNF, lexical tokens, op derivation, IR mapping — is in
 [`backport_ir/GRAMMAR.md`](backport_ir/GRAMMAR.md).
 
-### Current limits
+### Compile-time edge cases the engine handles
+
+- *Scalar ↔ complex type changes* (e.g. `secrets: inherit` → `secrets: {…map…}`):
+  detected and consolidated into a single parent-level `rewrite_value` with a
+  complex `value` payload (rendered in WSP as JSON flow). Otherwise the diff
+  decomposes into `ensure_present` on the new children plus `ensure_absent`
+  on the parent — and the latter would silently delete the whole key.
+- *Adding a whole new list element* (a step the source created that the
+  target doesn't have): flagged at compile time with `needs_review` —
+  v1 cannot synthesise new list elements; without the flag, apply would
+  silently report `inapplicable`.
+- *Removing a whole list element* (a step the source deleted): flagged at
+  compile time with `needs_review` — naïvely removing each key of the step
+  individually would leave a husk step with no `uses`/`run` that
+  `actionlint` will reject.
+
+### v1 limits (future work)
 
 - A new *top-level* key (e.g. an added `permissions:` block) is appended at
   end-of-file — semantically correct, but not position-matched to the source.
-- Adding/removing a whole list element (e.g. inserting a new step) is deferred;
-  such edits compile but are flagged `needs_review`.
+- Inserting / deleting a whole list element is not synthesised by the engine
+  (see above — flagged `needs_review`); a human completes such patches.
 - Pin resolution needs a GitHub-backed resolver; offline, pins are
   `needs_review`.
+- Multi-file coordination is per-file: a master commit that touches N
+  workflow files compiles to N independent `.wsp` programs with no
+  cross-file atomic-apply guarantee.
 
 ## Analysis scripts
 

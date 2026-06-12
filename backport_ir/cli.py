@@ -60,8 +60,17 @@ def cmd_backport(args) -> int:
     print(f"  patched:         {patched}")
     print(f"  needs review:    {review}")
     if args.oracle:
-        ok = sum(1 for r in rows if r.get("oracle", {}).get("success"))
-        print(f"  oracle success:  {ok}")
+        ok_zg = sum(1 for r in rows
+                    if r.get("oracle", {}).get("zizmor_global", {}).get("success"))
+        ok_zl = sum(1 for r in rows
+                    if r.get("oracle", {}).get("zizmor_local", {}).get("success"))
+        ok_a = sum(1 for r in rows
+                   if r.get("oracle", {}).get("actionlint", {}).get("success"))
+        ok_both = sum(1 for r in rows if r.get("oracle", {}).get("success"))
+        print(f"  zizmor global:      {ok_zg}     (target rule reduced anywhere on release)")
+        print(f"  zizmor local:       {ok_zl}     (target construct fixed at the master-targeted site)")
+        print(f"  actionlint:         {ok_a}     (no new lint findings)")
+        print(f"  zizmor_local AND actionlint: {ok_both}  (headline: paper-claim-correct)")
     return 0
 
 

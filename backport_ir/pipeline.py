@@ -21,7 +21,12 @@ from .apply import Resolver, apply_program
 from .compile import compile_program
 from .config import CLEAN_FIXES_DIR, GAPS_FILE, PATCHES_DIR, PROGRAMS_DIR
 from .ir import IRProgram
-from .verify import check_postconditions, zizmor_oracle
+from .verify import (
+    actionlint_oracle,
+    check_postconditions,
+    zizmor_oracle,
+    zizmor_oracle_local,
+)
 from .wsp import from_wsp, to_wsp
 
 
@@ -219,7 +224,31 @@ def run_backport(
                        "postconditions_ok": post["ok"],
                        "edits": [o.to_dict() for o in res.edits]}
                 if oracle:
-                    row["oracle"] = zizmor_oracle(prog, target_text, res.patched_text)
+                    # Three external checks:
+                    #   zizmor_global  - symmetric to pattern_miner's clean-fix
+                    #                    criterion (at least one targeted ident
+                    #                    reduced anywhere, nothing new). Loose
+                    #                    upper bound on the global effect.
+                    #   zizmor_local   - per-edit-locality: every landed edit's
+                    #                    scope must end up free of its targets,
+                    #                    no new findings within those scopes.
+                    #                    The honest "did the backport work at
+                    #                    the constructs master targeted" check.
+                    #   actionlint     - workflow still passes lint (no new
+                    #                    lint findings).
+                    # The headline `success` is zizmor_local AND actionlint —
+                    # the strongest of the three combined.
+                    z_global = zizmor_oracle(prog, target_text, res.patched_text)
+                    z_local = zizmor_oracle_local(
+                        prog, target_text, res.patched_text, res,
+                    )
+                    a = actionlint_oracle(target_text, res.patched_text)
+                    row["oracle"] = {
+                        "zizmor_global": z_global,
+                        "zizmor_local": z_local,
+                        "actionlint": a,
+                        "success": bool(z_local.get("success")) and bool(a.get("success")),
+                    }
                 (d / f"{flat}.report.json").write_text(
                     json.dumps(row, indent=2, ensure_ascii=False))
                 rows.append(row)
@@ -230,11 +259,23 @@ def run_backport(
     return rows
 
 
-# --- oracle (single file, needs zizmor) -------------------------------------
+# --- oracle (single file, needs zizmor + actionlint) ------------------------
 
 
 def run_oracle(program_path: Path, before_path: Path, patched_path: Path) -> dict:
+    """Run both external oracles on one patched file.
+
+    Acceptance requires BOTH to pass: zizmor confirms the security fix
+    landed without introducing new findings, AND actionlint introduces no
+    new lint findings (the strongest static "workflow still works" proxy).
+    """
     prog = load_program(program_path)
     before = Path(before_path).read_text(encoding="utf-8", errors="replace")
     patched = Path(patched_path).read_text(encoding="utf-8", errors="replace")
-    return zizmor_oracle(prog, before, patched)
+    z = zizmor_oracle(prog, before, patched)
+    a = actionlint_oracle(before, patched)
+    return {
+        "zizmor": z,
+        "actionlint": a,
+        "success": bool(z.get("success")) and bool(a.get("success")),
+    }

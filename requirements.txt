@@ -7,5 +7,7 @@ zizmor>=1.20
 requests>=2.31
 python-dotenv>=1.0
 
-# backport_ir/ — format-preserving YAML round-trip for patch generation
+# backport_ir/ — format-preserving YAML round-trip for patch generation,
+# plus actionlint (workflow lint) for the "still-works" external oracle.
 ruamel.yaml>=0.18
+actionlint-py>=1.7

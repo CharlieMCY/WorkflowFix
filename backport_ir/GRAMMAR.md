@@ -63,12 +63,20 @@ value          ::= "true" | "false" | "null"
 | `NUMBER` | a JSON number |
 | `DQSTRING` | a JSON double-quoted string (emitted only when a bareword would be ambiguous) |
 | `BAREWORD` | any other scalar text; may contain `@`, spaces, and `:` (see note) |
+| `JSON` | a JSON object or array, single-line flow form (e.g. `{"k": "v"}` or `[1, 2]`) — used by `_lit` for complex `rewrite_value` payloads |
 | `SP` | one or more spaces · `NL` newline · `BLANK` one or more blank lines · `TEXT` arbitrary text to end of line |
 
 **Value parsing** (`_parse_lit`): the text after `: ` is parsed as JSON first
-(`true`/`false`/`null`/number/quoted string); on failure it is taken verbatim as
-a bareword string. A `key: value` line is split on the **first** `:` only, so a
-value may itself contain `:` (e.g. the pin marker).
+(`true`/`false`/`null`/number/quoted string, **and JSON objects / arrays for
+complex `rewrite_value` payloads**); on failure it is taken verbatim as a
+bareword string. A `key: value` line is split on the **first** `:` only, so a
+value may itself contain `:` (e.g. the pin marker, or a JSON object value).
+
+**Complex values.** When a `rewrite_value` payload is a mapping or sequence
+(e.g. consolidating `secrets: inherit` → `secrets: {DEPLOY_TOKEN: …}` into one
+parent-level edit), the value is rendered as JSON flow on a single line. JSON
+flow is also legal YAML flow, so the patched output parses as a normal nested
+mapping; the JSON form is just the on-disk WSP representation.
 
 ## Anchors
 
@@ -124,17 +132,27 @@ never a guess.
 
 ## Review section
 
-Edits that cannot be auto-applied (e.g. inserting a whole new list element, which
-v1 does not support) are emitted as a trailing comment block:
+Edits the compiler flagged as not auto-applicable in v1 are emitted as a
+trailing comment block. Three classes get flagged at compile time:
+
+| Class | Why flagged |
+|---|---|
+| `list-element add/remove not yet supported` | edit's leaf is itself a list element (e.g. a `[str=release]` step) — v1 can edit *inside* a list element but cannot create or remove the element |
+| `adds a new list element; v1 cannot insert into target's list` | added path's anchor contains a list-identity (`[uses=X]`) that does not exist in the source's before-state — applying would silently fail as "inapplicable" |
+| `removes a whole list element; v1 cannot delete steps without leaving a husk` | removed path's anchor contains a list-identity that no longer exists in the source's after-state — naïvely deleting each child key would leave a step with no `uses`/`run`, which `actionlint` rejects |
+
+Rendered as:
 
 ```
 # --- needs review (not auto-applied) ---
 #   on.push.branches.[str=release]  ->  list-element add/remove not yet supported
+#   jobs.$JOB.steps[uses=goto-bus-stop/setup-zig].uses  ->  removes a whole list element; ...
 ```
 
 The whole section is comments. `from_wsp` ignores `#` lines in the body, so
 review items survive as human guidance without affecting `apply` (they are not
-executable edits).
+executable edits). Review-flagged edits never land — the per-edit-locality
+oracle gives them neither credit nor blame.
 
 ## Parsing conventions
 

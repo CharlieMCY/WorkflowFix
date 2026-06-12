@@ -20,7 +20,7 @@ from io import StringIO
 from typing import Any, Callable
 
 from .ir import ENSURE_ABSENT, ENSURE_PRESENT, REWRITE_VALUE, Edit, IRProgram
-from .match import _is_map, resolve
+from .match import _is_map, concrete_route, resolve
 
 # (action, ref) -> 40-hex SHA, or None if it can't be resolved.
 Resolver = Callable[[str, str], "str | None"]
@@ -73,11 +73,18 @@ class EditOutcome:
     status: str                          # applied|noop|created|inapplicable|needs_review
     sites: int = 0
     reason: str = ""
+    site_paths: list[str] = field(default_factory=list)
+    """Concrete YAML routes (zizmor format) this edit's anchor resolved to on
+    the target. Populated for any non-inapplicable / non-review outcome so the
+    per-edit-locality oracle can scope finding checks to where we actually
+    operated. Empty list = anchor didn't resolve."""
 
     def to_dict(self) -> dict[str, Any]:
         d = {"edit": self.edit, "op": self.op, "status": self.status, "sites": self.sites}
         if self.reason:
             d["reason"] = self.reason
+        if self.site_paths:
+            d["site_paths"] = self.site_paths
         return d
 
 
@@ -114,6 +121,22 @@ class ApplyResult:
         }
 
 
+def _site_for(m, edit: Edit) -> str:
+    """Concrete YAML route of the edit's effective target on the patched tree.
+
+    Combines the path actually walked during resolve (with metavariables
+    bound to their concrete job names and list-segs resolved to indices)
+    with any creatable mapping keys we would synthesise and finally the
+    edit's own key, so the result names the exact leaf the edit affects.
+    """
+    full_path = list(m.path)
+    for seg in m.remaining:              # creatable mapping chain (keys only)
+        if seg.kind == "key":
+            full_path.append(("key", seg.name))
+    full_path.append(("key", edit.key))
+    return concrete_route(full_path)
+
+
 def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome:
     if edit.review:
         return EditOutcome(edit.describe(), edit.op, "needs_review", 0, edit.review)
@@ -128,6 +151,7 @@ def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome
     created = False
     reasons: list[str] = []
     review = False
+    site_paths: list[str] = []
 
     for m in matches:
         cont = m.container
@@ -140,6 +164,10 @@ def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome
         if m.weak:
             review = True
             reasons.append("weak anchor (run/anon/multi-match)")
+
+        # Record the site we operated at (or considered) so the per-edit-
+        # locality oracle can scope its finding checks to here.
+        site_paths.append(_site_for(m, edit))
 
         if edit.op == ENSURE_PRESENT:
             if _is_map(cont) and cont.get(edit.key) != edit.value:
@@ -178,12 +206,16 @@ def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome
 
     if review:
         return EditOutcome(edit.describe(), edit.op, "needs_review", sites,
-                           "; ".join(sorted(set(reasons))))
+                           "; ".join(sorted(set(reasons))),
+                           site_paths=site_paths)
     if sites and created:
-        return EditOutcome(edit.describe(), edit.op, "created", sites)
+        return EditOutcome(edit.describe(), edit.op, "created", sites,
+                           site_paths=site_paths)
     if sites:
-        return EditOutcome(edit.describe(), edit.op, "applied", sites)
-    return EditOutcome(edit.describe(), edit.op, "noop", 0, "already satisfied")
+        return EditOutcome(edit.describe(), edit.op, "applied", sites,
+                           site_paths=site_paths)
+    return EditOutcome(edit.describe(), edit.op, "noop", 0, "already satisfied",
+                       site_paths=site_paths)
 
 
 def apply_program(

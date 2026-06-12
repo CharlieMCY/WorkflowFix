@@ -39,6 +39,8 @@ _DISAMBIG = re.compile(r"~\d+$")        # the per-identity appearance suffix
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _ANON_RE = re.compile(r"^#\d+$")
 
+_MISSING = object()
+
 
 # --- flat-path -> structured segments ---------------------------------------
 
@@ -146,10 +148,149 @@ def diff_texts(before_text: str, after_text: str):
     return added, removed, changed
 
 
+# --- type-change consolidation ----------------------------------------------
+
+
+def _walk_mapping_path(doc: Any, path: str) -> Any:
+    """Walk a dotted mapping path through `doc`. Return value or `_MISSING`.
+
+    Restricted to pure-dot paths (no list brackets); type-change consolidation
+    only applies to mapping-to-mapping/scalar transitions where a single key's
+    value type flipped between scalar and complex.
+    """
+    if "[" in path:
+        return _MISSING
+    if path == "":
+        return doc if doc is not None else _MISSING
+    node = doc
+    for seg in path.split("."):
+        if not isinstance(node, dict) or seg not in node:
+            return _MISSING
+        node = node[seg]
+    return node
+
+
+def _consolidate_type_changes(
+    added: dict, removed: dict, before_doc: Any, after_doc: Any,
+):
+    """Detect scalar<->complex type changes and rewrite as parent-level edits.
+
+    Without this, `secrets: inherit` -> `secrets: {DEPLOY_TOKEN: ...}` decomposes
+    into (ensure_present DEPLOY_TOKEN under secrets) + (ensure_absent secrets) —
+    and the absent wins, deleting the whole key. Consolidating the change into a
+    single rewrite at the parent fixes it.
+
+    Returns (added', removed', extra_changed).
+    """
+    extra_changed: dict[str, tuple[Any, Any]] = {}
+    suppress_added: set[str] = set()
+    suppress_removed: set[str] = set()
+
+    # scalar -> complex: P in removed AND P.foo / P[..] in added
+    for rpath, rval in list(removed.items()):
+        if "[" in rpath:
+            continue
+        prefix_dot, prefix_brk = rpath + ".", rpath + "["
+        children = [p for p in added
+                    if p.startswith(prefix_dot) or p.startswith(prefix_brk)]
+        if not children:
+            continue
+        new_val = _walk_mapping_path(after_doc, rpath)
+        if new_val is _MISSING:
+            continue
+        extra_changed[rpath] = (rval, new_val)
+        suppress_removed.add(rpath)
+        suppress_added.update(children)
+
+    # complex -> scalar: P in added AND P.foo / P[..] in removed
+    for apath, aval in list(added.items()):
+        if apath in suppress_added or "[" in apath:
+            continue
+        prefix_dot, prefix_brk = apath + ".", apath + "["
+        old_children = [p for p in removed
+                        if p.startswith(prefix_dot) or p.startswith(prefix_brk)]
+        if not old_children:
+            continue
+        old_val = _walk_mapping_path(before_doc, apath)
+        if old_val is _MISSING:
+            old_val = "<complex>"           # sketch only; apply ignores it
+        extra_changed[apath] = (old_val, aval)
+        suppress_added.add(apath)
+        suppress_removed.update(old_children)
+
+    added2 = {k: v for k, v in added.items() if k not in suppress_added}
+    removed2 = {k: v for k, v in removed.items() if k not in suppress_removed}
+    return added2, removed2, extra_changed
+
+
+# --- list-element addition detection ----------------------------------------
+
+
+def _seg_eq(a: Seg, b: Seg) -> bool:
+    """Equality for the purpose of "did this segment appear in before?"."""
+    if a.kind != b.kind:
+        return False
+    if a.kind == "key":
+        return a.name == b.name
+    if a.kind == "list":
+        return a.list_kind == b.list_kind and a.value == b.value
+    return True                              # keyvar — only emitted at compile-time
+
+
+def _list_segs_existed(paths: list[str]) -> list[list[Seg]]:
+    """Pre-parse every path into its seg sequence for prefix matching."""
+    return [parse_path(p) for p in paths]
+
+
+def _anchor_list_seg_present(
+    path: str, ref_segs_list: list[list[Seg]],
+) -> bool:
+    """True iff every list-identity segment in `path`'s anchor appears on a
+    matching prefix in at least one reference path. False iff some list-seg
+    has no matching prefix — meaning the list element doesn't exist in the
+    reference state.
+    """
+    segs = parse_path(path)
+    for i, seg in enumerate(segs):
+        if seg.kind != "list":
+            continue
+        prefix = segs[: i + 1]
+        ok = False
+        for rsegs in ref_segs_list:
+            if len(rsegs) < len(prefix):
+                continue
+            if all(_seg_eq(prefix[j], rsegs[j]) for j in range(len(prefix))):
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def _path_introduces_new_list_element(
+    path: str, before_segs_list: list[list[Seg]],
+) -> bool:
+    """True iff this added path requires inventing a new list element (v1 can't)."""
+    return not _anchor_list_seg_present(path, before_segs_list)
+
+
+def _path_removes_whole_list_element(
+    path: str, after_segs_list: list[list[Seg]],
+) -> bool:
+    """True iff this removed path is part of a list element the maintainer
+    deleted in its entirety (v1 can't synthesize element-level deletion;
+    naively removing each key leaves a husk step that actionlint will reject).
+    """
+    return not _anchor_list_seg_present(path, after_segs_list)
+
+
 # --- one leaf edit ----------------------------------------------------------
 
 
-def _edit_for_leaf(path: str, op: str, value: Any = None, old: Any = None) -> Edit | None:
+def _edit_for_leaf(
+    path: str, op: str, value: Any = None, old: Any = None,
+    review_reason: str = "",
+) -> Edit | None:
     segs = _metavar_jobs(parse_path(path))
     if not segs:
         return None
@@ -177,7 +318,8 @@ def _edit_for_leaf(path: str, op: str, value: Any = None, old: Any = None) -> Ed
                         expected_old=_value_sketch(old))
 
     return Edit(op=op, anchor=anchor, key=key, value=value,
-                expected_old=(_value_sketch(old) if old is not None else None))
+                expected_old=(_value_sketch(old) if old is not None else None),
+                review=review_reason)
 
 
 # --- top-level --------------------------------------------------------------
@@ -194,13 +336,46 @@ def compile_program(
 ) -> IRProgram:
     """Compile (before -> after) into an executable IRProgram."""
     added, removed, changed = diff_texts(before_text, after_text)
+
+    # 1) Consolidate scalar<->complex type changes into parent-level rewrites.
+    #    Without this, e.g. `secrets: inherit` -> `secrets: {DEPLOY_TOKEN: ...}`
+    #    decomposes into (ensure_present DEPLOY_TOKEN) + (ensure_absent secrets)
+    #    and the absent silently wins, deleting the whole `secrets` key.
+    before_doc = load_safe(before_text) or {}
+    after_doc = load_safe(after_text) or {}
+    added, removed, extra_changed = _consolidate_type_changes(
+        added, removed, before_doc, after_doc,
+    )
+    for k, v in extra_changed.items():
+        changed[k] = v                       # overrides any scalar->scalar entry
+
+    # 2) Pre-compute which paths cross list-element boundaries so we can flag
+    #    them at compile time (otherwise the engine produces silently-broken
+    #    output that zizmor accepts but actionlint catches as broken YAML).
+    #
+    #      - added: anchor's list-seg doesn't exist in before  -> v1 would have
+    #        to invent a new list element; apply will be "inapplicable".
+    #      - removed: anchor's list-seg doesn't exist in after -> the whole
+    #        list element was deleted by the maintainer. Removing each key
+    #        individually leaves a husk step ({} with no `uses`/`run`), which
+    #        actionlint will reject. v1 can't synthesize element-level deletion.
+    before_segs_list = _list_segs_existed(list(_flatten_text(before_text).keys()))
+    after_segs_list = _list_segs_existed(list(_flatten_text(after_text).keys()))
+
     edits: list[Edit] = []
     for p, v in sorted(added.items()):
-        e = _edit_for_leaf(p, ENSURE_PRESENT, value=v)
+        reason = ""
+        if _path_introduces_new_list_element(p, before_segs_list):
+            reason = "adds a new list element; v1 cannot insert into target's list"
+        e = _edit_for_leaf(p, ENSURE_PRESENT, value=v, review_reason=reason)
         if e:
             edits.append(e)
     for p in sorted(removed):
-        e = _edit_for_leaf(p, ENSURE_ABSENT)
+        reason = ""
+        if _path_removes_whole_list_element(p, after_segs_list):
+            reason = ("removes a whole list element; "
+                      "v1 cannot delete steps without leaving a husk")
+        e = _edit_for_leaf(p, ENSURE_ABSENT, review_reason=reason)
         if e:
             edits.append(e)
     for p, (old, new) in sorted(changed.items()):

@@ -60,6 +60,11 @@ def _lit(v) -> str:
         return "null"
     if isinstance(v, (int, float)):
         return str(v)
+    # Complex values (dicts/lists) — emitted as JSON, which is valid YAML flow
+    # syntax. `_parse_lit` round-trips this through json.loads, so a compiled
+    # complex rewrite_value survives WSP -> IR -> WSP without loss.
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
     s = str(v)
     if (not s) or s != s.strip() or s.lower() in ("true", "false", "null") \
             or any(c in s for c in ":#") or s[0] in "[{'\"":

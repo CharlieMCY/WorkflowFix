@@ -61,6 +61,12 @@ class AnchorMatch:
     matched_step: Any = None             # nearest uses-step passed through (for pin)
     bindings: dict[str, str] = field(default_factory=dict)
     weak: bool = False                   # matched via weak identity -> needs review
+    path: list[tuple[str, Any]] = field(default_factory=list)
+    """Concrete path walked through the target tree. Each step is
+    ('key', name) for a mapping key (with $JOB metavariables resolved to the
+    bound name) or ('idx', i) for a list index. Used by the per-edit-locality
+    oracle to localise zizmor findings to the YAML subtree this match points
+    at."""
 
     @property
     def status(self) -> str:
@@ -69,6 +75,22 @@ class AnchorMatch:
         if all(s.kind == "key" for s in self.remaining):
             return "creatable"           # only mapping keys missing -> can build
         return "unresolvable"            # would require inventing a job/step
+
+
+def concrete_route(path: list[tuple[str, Any]]) -> str:
+    """Render a path captured during resolve() in zizmor's route format.
+
+    zizmor's `_route_to_str` produces e.g. 'jobs.publish.steps[2].run' —
+    keys joined by '.', indices appended with no separator. We match that
+    exactly so the per-edit-locality oracle can string-prefix-compare paths.
+    """
+    parts: list[str] = []
+    for kind, val in path:
+        if kind == "key":
+            parts.append(str(val))
+        elif kind == "idx":
+            parts.append(f"[{val}]")
+    return ".".join(parts).replace(".[", "[")
 
 
 def resolve(root: Any, anchor: Anchor) -> list[AnchorMatch]:
@@ -87,7 +109,8 @@ def resolve(root: Any, anchor: Anchor) -> list[AnchorMatch]:
             if seg.kind == "key":
                 if _is_map(node) and seg.name in node:
                     nxt.append(AnchorMatch(node[seg.name], rest, m.matched_step,
-                                           dict(m.bindings), m.weak))
+                                           dict(m.bindings), m.weak,
+                                           m.path + [("key", seg.name)]))
                 else:
                     # can't descend; freeze here (creatable/unresolvable by remaining)
                     results.append(m)
@@ -98,17 +121,20 @@ def resolve(root: Any, anchor: Anchor) -> list[AnchorMatch]:
                         if _is_map(jobval):
                             b = dict(m.bindings)
                             b[seg.var] = jobname
-                            nxt.append(AnchorMatch(jobval, rest, m.matched_step, b, m.weak))
+                            nxt.append(AnchorMatch(jobval, rest, m.matched_step, b,
+                                                   m.weak,
+                                                   m.path + [("key", jobname)]))
                 # no job to bind -> candidate dies (never invent a job)
 
             elif seg.kind == "list":
                 if _is_seq(node):
-                    hits = [e for e in node
+                    hits = [(i, e) for i, e in enumerate(node)
                             if step_identity_matches(e, seg.list_kind, seg.value)]
                     weak = m.weak or seg.list_kind in ("run", "anon") or len(hits) > 1
-                    for e in hits:
+                    for i, e in hits:
                         ms = e if (seg.list_kind == "uses" and _is_map(e)) else m.matched_step
-                        nxt.append(AnchorMatch(e, rest, ms, dict(m.bindings), weak))
+                        nxt.append(AnchorMatch(e, rest, ms, dict(m.bindings), weak,
+                                               m.path + [("idx", i)]))
                 # no hit -> candidate dies (never invent a step)
 
         frontier = nxt

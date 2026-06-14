@@ -1,15 +1,18 @@
 """Content-addressed caches for expensive external calls.
 
-Two pluggable caches, both file-based, both dataset-independent
+Three pluggable caches, all file-based, all dataset-independent
 (several DATASET_TAG runs share the same cache hits):
 
   github_file_cache    keyed by (repo, ref, path), stores the bytes
                        returned by GitHub's contents API and the file's
                        blob_sha. Marks missing files so we don't re-ask.
+  github_commit_cache  keyed by (repo, sha), stores the full commit JSON
+                       from GitHub's commits API. A commit at a given
+                       SHA is immutable, so cache entries never expire.
   llm_call_cache       keyed by sha256(model || system || user), stores
                        the response text + token counts.
 
-Both layouts use 2-level sharded directories under cache/ to keep any
+All layouts use 2-level sharded directories under cache/ to keep any
 one directory from holding more than ~10k entries.
 """
 from __future__ import annotations
@@ -104,6 +107,70 @@ def github_file_cached_fetch(
         return None
     content, blob_sha = fetched
     github_file_put(repo, ref, path, content, blob_sha)
+    return fetched
+
+
+# --- GitHub commit cache --------------------------------------------------
+
+
+def _commit_path(repo: str, sha: str) -> Path:
+    key = _sha(f"{repo}\0{sha}")
+    return cache_dir() / "commit" / _shard(key)
+
+
+def github_commit_get(repo: str, sha: str) -> dict | None:
+    """Return the cached commit dict, or None if not present (covers both
+    'never cached' AND 'cached as missing' — use `github_commit_cached_missing`
+    to distinguish)."""
+    p = _commit_path(repo, sha).with_suffix(".json")
+    if p.exists():
+        return json.loads(p.read_text())
+    return None
+
+
+def github_commit_cached_missing(repo: str, sha: str) -> bool:
+    """True iff we cached a 404 for this (repo, sha)."""
+    return _commit_path(repo, sha).with_suffix(".missing").exists()
+
+
+def github_commit_put(repo: str, sha: str, commit: dict) -> None:
+    p = _commit_path(repo, sha).with_suffix(".json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(commit, ensure_ascii=False))
+
+
+def github_commit_put_missing(repo: str, sha: str) -> None:
+    p = _commit_path(repo, sha).with_suffix(".missing")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch()
+
+
+def github_commit_cached_fetch(client, repo: str, sha: str) -> dict | None:
+    """Serve a `get_commit` call from cache, falling back to the network.
+
+    Calls `client._get_commit_uncached` on miss. Same convention as the
+    file cache:
+
+      - public `client.get_commit` -> goes through this cache
+      - private `client._get_commit_uncached` -> raw API call
+
+    Cache layout:
+        cache/commit/<2>/<2>/<sha>.json     full commit dict
+        cache/commit/<2>/<2>/<sha>.missing  negative-cache marker
+
+    Commits at a given SHA are immutable in git, so cache entries never
+    expire and never need invalidation.
+    """
+    hit = github_commit_get(repo, sha)
+    if hit is not None:
+        return hit
+    if github_commit_cached_missing(repo, sha):
+        return None
+    fetched = client._get_commit_uncached(repo, sha)
+    if fetched is None:
+        github_commit_put_missing(repo, sha)
+        return None
+    github_commit_put(repo, sha, fetched)
     return fetched
 
 

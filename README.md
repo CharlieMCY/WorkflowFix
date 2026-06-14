@@ -46,8 +46,20 @@ Analysis reports follow the same convention:
 - `DATASET_TAG=50k` → `analysis_tools/reports/50k/`
 
 A shared content-addressed cache (`cache/`) is **independent of the tag**, so
-`50k` and `10k` runs share GitHub-file fetches and LLM responses (keyed by the
-content's hash, not the dataset). Both `output/` and `cache/` are gitignored.
+`50k` and `10k` runs share three things keyed by their content, not the
+dataset:
+
+| Cache layer | What it stores | Key |
+|---|---|---|
+| `cache/github/` | file bytes at a ref + blob SHA | `(repo, ref, path)` |
+| `cache/commit/` | full commit JSON from GitHub | `(repo, sha)` (immutable, never expires) |
+| `cache/llm/`    | LLM completion text + token counts | sha256(model ‖ system ‖ user) |
+
+Branch-snapshot queries (branch list, "is SHA in branch HEAD's history?",
+"commits touching path on branch") are **not** cached — their answer
+depends on whichever HEAD a branch points at right now, so caching would
+silently serve stale results into paper claims. Both `output/` and
+`cache/` are gitignored.
 
 Run all examples below with the tag set explicitly, e.g. `DATASET_TAG=50k …`.
 Without a tag the pipeline writes to the legacy top-level `output/`, which is

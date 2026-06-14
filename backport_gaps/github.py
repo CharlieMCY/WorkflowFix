@@ -52,7 +52,7 @@ class GitHubClient:
     # --- HTTP -----------------------------------------------------------
 
     def _get(self, path: str, params: dict | None = None,
-             allow_404: bool = False) -> requests.Response:
+             allow_404: bool = False, allow_422: bool = False) -> requests.Response:
         url = path if path.startswith("http") else f"{_BASE}{path}"
         for attempt in range(4):
             try:
@@ -67,6 +67,8 @@ class GitHubClient:
             if r.status_code == 200:
                 return r
             if r.status_code == 404 and allow_404:
+                return r
+            if r.status_code == 422 and allow_422:
                 return r
             if r.status_code == 403 and "rate limit" in r.text.lower():
                 reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
@@ -116,7 +118,27 @@ class GitHubClient:
         return status in ("behind", "identical")
 
     def get_commit(self, repo: str, sha: str) -> dict | None:
-        r = self._get(f"/repos/{repo}/commits/{sha}", allow_404=True)
+        """Return the commit dict at `(repo, sha)`, or None if 404.
+
+        Routes through `common.cache.github_commit_cached_fetch` so a
+        commit fetched once (possibly under a different DATASET_TAG) is
+        served from local cache. Commits are immutable, so cache entries
+        never expire. On miss the cache layer calls
+        `_get_commit_uncached` below.
+        """
+        from common.cache import github_commit_cached_fetch
+        return github_commit_cached_fetch(self, repo, sha)
+
+    def _get_commit_uncached(self, repo: str, sha: str) -> dict | None:
+        """The bare GitHub API call. Cache layer invokes this on miss.
+
+        Treats both 404 and 422 as "no such commit in this repo" — GitHub
+        returns 422 for valid-format SHAs not found in the repo (vs. 404
+        for malformed paths). Either way the right answer is None, which
+        the cache layer persists as a `.missing` marker.
+        """
+        r = self._get(f"/repos/{repo}/commits/{sha}", allow_404=True,
+                       allow_422=True)
         return r.json() if r.status_code == 200 else None
 
     def get_file_at_ref(self, repo: str, path: str, ref: str) -> tuple[bytes, str] | None:

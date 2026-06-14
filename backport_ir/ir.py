@@ -54,9 +54,11 @@ class Seg:
 
     kind: str
     name: str = ""        # kind=='key'
-    var: str = ""         # kind=='keyvar'
+    var: str = ""         # kind=='keyvar'  (the paper's job_name placeholder)
     list_kind: str = ""   # kind=='list': uses|id|name|run|str|scalar|anon
+                          #               (the paper's `field` in [field=context])
     value: str = ""       # kind=='list': identity value
+                          #               (the paper's `context` in [field=context])
 
     @staticmethod
     def key(name: str) -> "Seg":

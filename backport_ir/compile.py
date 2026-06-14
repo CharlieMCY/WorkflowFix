@@ -270,7 +270,8 @@ def _anchor_list_seg_present(
 def _path_introduces_new_list_element(
     path: str, before_segs_list: list[list[Seg]],
 ) -> bool:
-    """True iff this added path requires inventing a new list element (v1 can't)."""
+    """True iff this added path requires inventing a new list element
+    (the engine does not synthesize element-level insertion)."""
     return not _anchor_list_seg_present(path, before_segs_list)
 
 
@@ -278,8 +279,9 @@ def _path_removes_whole_list_element(
     path: str, after_segs_list: list[list[Seg]],
 ) -> bool:
     """True iff this removed path is part of a list element the maintainer
-    deleted in its entirety (v1 can't synthesize element-level deletion;
-    naively removing each key leaves a husk step that actionlint will reject).
+    deleted in its entirety (the engine does not synthesize element-level
+    deletion; naively removing each key leaves a husk step that actionlint
+    will reject).
     """
     return not _anchor_list_seg_present(path, after_segs_list)
 
@@ -353,12 +355,13 @@ def compile_program(
     #    them at compile time (otherwise the engine produces silently-broken
     #    output that zizmor accepts but actionlint catches as broken YAML).
     #
-    #      - added: anchor's list-seg doesn't exist in before  -> v1 would have
-    #        to invent a new list element; apply will be "inapplicable".
+    #      - added: anchor's list-seg doesn't exist in before  -> would
+    #        require inventing a new list element; apply will be "inapplicable".
     #      - removed: anchor's list-seg doesn't exist in after -> the whole
     #        list element was deleted by the maintainer. Removing each key
     #        individually leaves a husk step ({} with no `uses`/`run`), which
-    #        actionlint will reject. v1 can't synthesize element-level deletion.
+    #        actionlint will reject. The engine does not synthesize
+    #        element-level deletion.
     before_segs_list = _list_segs_existed(list(_flatten_text(before_text).keys()))
     after_segs_list = _list_segs_existed(list(_flatten_text(after_text).keys()))
 
@@ -366,15 +369,16 @@ def compile_program(
     for p, v in sorted(added.items()):
         reason = ""
         if _path_introduces_new_list_element(p, before_segs_list):
-            reason = "adds a new list element; v1 cannot insert into target's list"
+            reason = ("adds a new list element; the engine cannot "
+                      "insert into the target's list")
         e = _edit_for_leaf(p, ENSURE_PRESENT, value=v, review_reason=reason)
         if e:
             edits.append(e)
     for p in sorted(removed):
         reason = ""
         if _path_removes_whole_list_element(p, after_segs_list):
-            reason = ("removes a whole list element; "
-                      "v1 cannot delete steps without leaving a husk")
+            reason = ("removes a whole list element; the engine cannot "
+                      "delete steps without leaving a husk")
         e = _edit_for_leaf(p, ENSURE_ABSENT, review_reason=reason)
         if e:
             edits.append(e)

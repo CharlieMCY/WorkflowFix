@@ -2,7 +2,10 @@
 
 Reuses pattern_miner's OUTPUT_DIR / BLOBS_DIR so the IR stage plugs straight
 into the same `output/` tree the miner already populates (clean_fixes/, and the
-backport_gaps/ gap tickets it later consumes).
+backport_gaps/ gap tickets it later consumes). Because pattern_miner.config's
+OUTPUT_DIR already honours DATASET_TAG, the IR stage automatically lands under
+the same per-dataset subtree (e.g. output/10k/backport_ir/ vs
+output/50k/backport_ir/).
 """
 from __future__ import annotations
 

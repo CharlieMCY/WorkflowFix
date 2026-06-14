@@ -10,9 +10,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from common.dataset import output_dir
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = REPO_ROOT / ".env"
-OUTPUT_DIR = REPO_ROOT / "output"
+OUTPUT_DIR = output_dir()
 GAPS_DIR = OUTPUT_DIR / "backport_gaps"
 
 # load .env at import time, but do not overwrite already-set environment vars

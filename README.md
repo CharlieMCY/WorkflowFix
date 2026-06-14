@@ -33,9 +33,29 @@ python3 -m venv .venv
 `zizmor` is installed as a Python package; the binary lives at
 `.venv/bin/zizmor`. No GitHub authentication is needed at any stage.
 
+## Dataset tagging (`DATASET_TAG`)
+
+Every output path used by every stage is routed through `common.dataset.output_dir()`,
+which honours the `DATASET_TAG` environment variable:
+
+- `DATASET_TAG=50k` → `output/50k/`
+- `DATASET_TAG=10k` → `output/10k/`
+- (unset)           → `output/` (legacy / scratch)
+
+Analysis reports follow the same convention:
+- `DATASET_TAG=50k` → `analysis_tools/reports/50k/`
+
+A shared content-addressed cache (`cache/`) is **independent of the tag**, so
+`50k` and `10k` runs share GitHub-file fetches and LLM responses (keyed by the
+content's hash, not the dataset). Both `output/` and `cache/` are gitignored.
+
+Run all examples below with the tag set explicitly, e.g. `DATASET_TAG=50k …`.
+Without a tag the pipeline writes to the legacy top-level `output/`, which is
+empty in a clean checkout.
+
 ## Pipeline
 
-Five stages, each writes to `output/`:
+Five stages, each writes to `output/<DATASET_TAG>/`:
 
 ```
 sample        CSV               -> sampled_commits.parquet
@@ -54,12 +74,13 @@ is the programmatic catalog.
 End-to-end (sample → diffs → scan → clean-fixes → patterns):
 
 ```bash
-.venv/bin/python -m pattern_miner pipeline --n-commits 50000
+DATASET_TAG=50k .venv/bin/python -m pattern_miner pipeline --n-commits 50000
 ```
 
 Or stage by stage:
 
 ```bash
+export DATASET_TAG=50k
 .venv/bin/python -m pattern_miner sample --n-commits 50000
 .venv/bin/python -m pattern_miner diffs
 .venv/bin/python -m pattern_miner scan
@@ -84,19 +105,22 @@ after 10k reuses every already-scanned blob.
 ### Full pipeline (all stages, in order)
 
 The complete chain to reproduce every number in the **Results walkthrough**
-below:
+below. Set `DATASET_TAG` once at the top of the shell and all stages route
+to `output/$DATASET_TAG/`:
 
 ```bash
+export DATASET_TAG=50k
+
 # 1. Local mining (no GitHub) — ~45 min for 50k
 .venv/bin/python -m pattern_miner pipeline --n-commits 50000
 
 # 2. (For analysis 03) Build an out-of-sample evaluation set
 .venv/bin/python -m pattern_miner sample --n-commits 2000 --seed 99 \
-    --out output/eval_sampled.parquet
+    --out output/$DATASET_TAG/eval_sampled.parquet
 .venv/bin/python -m pattern_miner diffs \
-    --sample output/eval_sampled.parquet \
-    --out output/eval_diffs.jsonl
-.venv/bin/python -m pattern_miner scan --diffs output/eval_diffs.jsonl
+    --sample output/$DATASET_TAG/eval_sampled.parquet \
+    --out output/$DATASET_TAG/eval_diffs.jsonl
+.venv/bin/python -m pattern_miner scan --diffs output/$DATASET_TAG/eval_diffs.jsonl
 
 # 3. Backport-gap audit + history classification (needs GITHUB_TOKEN, see below) — ~hours
 .venv/bin/python -m backport_gaps find-gaps              # ~3 h on 50k
@@ -166,18 +190,25 @@ caller can swap `V_fixed_idents` for any other classification.
 
 ## Output layout
 
+Every artifact below sits under `output/<DATASET_TAG>/` (e.g. `output/50k/`):
+
 ```
 output/
-├── sampled_commits.parquet   # input: commit-level sample with file lists
-├── diffs.jsonl               # intermediate: one row per (commit, workflow file)
-├── scans.jsonl               # intermediate: one row per unique blob hash
-├── patterns.jsonl            # FINAL: pattern catalog
-└── clean_fixes/              # FINAL: human-inspectable dump
-    ├── index.jsonl           # summary index, one row per commit
-    └── <repo_safe>__<sha10>/ # one directory per commit
-        ├── meta.json
-        ├── <flat-file>.before.yml
-        └── <flat-file>.after.yml
+├── 50k/                          # one tag per sampled run
+│   ├── sampled_commits.parquet   # input: commit-level sample with file lists
+│   ├── diffs.jsonl               # intermediate: one row per (commit, workflow file)
+│   ├── scans.jsonl               # intermediate: one row per unique blob hash
+│   ├── patterns.jsonl            # FINAL: pattern catalog
+│   ├── clean_fixes/              # FINAL: human-inspectable dump
+│   │   ├── index.jsonl           # summary index, one row per commit
+│   │   └── <repo_safe>__<sha10>/ # one directory per commit
+│   │       ├── meta.json
+│   │       ├── <flat-file>.before.yml
+│   │       └── <flat-file>.after.yml
+│   ├── backport_gaps/            # gap audit + history classification (§ below)
+│   └── backport_ir/              # compiled .wsp programs + backport runs
+└── 10k/                          # an older sample, untouched by 50k runs
+    └── …
 ```
 
 `meta.json` per clean-fix commit:
@@ -206,7 +237,7 @@ output/
 ## Backport-gap audit (separate module)
 
 [`backport_gaps/`](backport_gaps/) is a separate module that consumes
-`output/clean_fixes/` (produced by `pattern_miner`) and, for each clean-fix
+`output/$DATASET_TAG/clean_fixes/` (produced by `pattern_miner`) and, for each clean-fix
 commit on a project's default branch, audits the project's release-style
 branches via the GitHub API to find ones where the fixed zizmor finding is
 **still present**. These are the backporting opportunities.
@@ -225,7 +256,7 @@ A fine-grained PAT with read-only access to public repositories is enough.
 ### Run
 
 ```bash
-# Audit every clean-fix commit (uses output/clean_fixes/*/meta.json as input)
+# Audit every clean-fix commit (uses output/$DATASET_TAG/clean_fixes/*/meta.json as input)
 .venv/bin/python -m backport_gaps find-gaps
 
 # Summarize the resulting gaps.jsonl
@@ -293,7 +324,7 @@ keep worst-case audit time bounded. Anything beyond becomes
 ### Output layout
 
 ```
-output/backport_gaps/
+output/<DATASET_TAG>/backport_gaps/
 ├── gaps.jsonl                  # one row per clean-fix commit (gap audit)
 └── gaps_with_history.jsonl     # gap audit + per-branch history classification
 ```
@@ -393,10 +424,13 @@ and external oracles:**
 ### Run
 
 ```bash
+export DATASET_TAG=50k
+
 # offline smoke test — needs no Gigawork data, no GitHub, no zizmor
 .venv/bin/python -m backport_ir selfcheck
 
-# compile clean-fix commits into .wsp programs (output/backport_ir/programs/)
+# compile clean-fix commits into .wsp programs
+#   (output/$DATASET_TAG/backport_ir/programs/)
 .venv/bin/python -m backport_ir compile [--limit N]
 
 # apply one program to a LOCAL target workflow (offline)
@@ -482,14 +516,14 @@ The full grammar — EBNF, lexical tokens, op derivation, IR mapping — is in
   on the parent — and the latter would silently delete the whole key.
 - *Adding a whole new list element* (a step the source created that the
   target doesn't have): flagged at compile time with `needs_review` —
-  v1 cannot synthesise new list elements; without the flag, apply would
-  silently report `inapplicable`.
+  the engine does not synthesise new list elements; without the flag,
+  apply would silently report `inapplicable`.
 - *Removing a whole list element* (a step the source deleted): flagged at
   compile time with `needs_review` — naïvely removing each key of the step
   individually would leave a husk step with no `uses`/`run` that
   `actionlint` will reject.
 
-### v1 limits (future work)
+### Current limits (future work)
 
 - A new *top-level* key (e.g. an added `permissions:` block) is appended at
   end-of-file — semantically correct, but not position-matched to the source.
@@ -520,11 +554,12 @@ deliberately compact and don't show all of these.
 
 ### How to run
 
-Each script is `python -m analysis.<NN_name>`. They expect `output/` to
-contain the artifacts listed in the **Inputs** column above. Run any
-single one:
+Each script is `python -m analysis.<NN_name>`. They expect
+`output/$DATASET_TAG/` to contain the artifacts listed in the **Inputs**
+column above. Run any single one:
 
 ```bash
+export DATASET_TAG=50k
 .venv/bin/python -m analysis.01_clean_fix_filter_comparison
 .venv/bin/python -m analysis.02_pattern_distribution
 .venv/bin/python -m analysis.04_gap_audit_drill
@@ -537,12 +572,14 @@ Analysis 03 additionally requires a fresh out-of-sample evaluation set
 it once, then re-run 03 any time:
 
 ```bash
+export DATASET_TAG=50k
 # build the eval set (seed=99, disjoint from default seed=42)
 .venv/bin/python -m pattern_miner sample --n-commits 2000 --seed 99 \
-    --out output/eval_sampled.parquet
+    --out output/$DATASET_TAG/eval_sampled.parquet
 .venv/bin/python -m pattern_miner diffs \
-    --sample output/eval_sampled.parquet --out output/eval_diffs.jsonl
-.venv/bin/python -m pattern_miner scan --diffs output/eval_diffs.jsonl
+    --sample output/$DATASET_TAG/eval_sampled.parquet \
+    --out output/$DATASET_TAG/eval_diffs.jsonl
+.venv/bin/python -m pattern_miner scan --diffs output/$DATASET_TAG/eval_diffs.jsonl
 
 # run the match
 .venv/bin/python -m analysis.03_match_eval
@@ -573,10 +610,137 @@ Most of the same numbers are also available via the pipeline's own
 .venv/bin/python -m backport_gaps history-summary    # backport-status overview
 ```
 
+## Evaluation harnesses (`analysis_tools/`) — §V
+
+[`analysis_tools/`](analysis_tools/) holds the RQ5-7 evaluation harnesses
+that turn the §III artifacts into the §V tables. They consume the same
+`output/$DATASET_TAG/` tree the rest of the pipeline produces, write
+reports under `analysis_tools/reports/$DATASET_TAG/`, and judge every
+patch by the same external oracles (`zizmor_local` + `actionlint`)
+backport_ir's `--oracle` mode uses.
+
+**Prerequisites** (must exist for the same `DATASET_TAG`):
+`clean_fixes/*/meta.json` (`pattern_miner pipeline`),
+`backport_gaps/gaps.jsonl` (`backport_gaps find-gaps`),
+`backport_gaps/gaps_with_history.jsonl` (`backport_gaps classify-history`),
+`backport_ir/programs/*.wsp` (`backport_ir compile`),
+and a valid `GITHUB_TOKEN` in `.env`.
+
+**Resume safety**: every script row-appends results to its `*_rows.jsonl`
+and skips already-completed `(repo, commit, branch, file)` on re-run, so
+crashing or Ctrl-C never destroys prior work — just re-launch the same
+command. GitHub fetches and LLM calls flow through the shared (tag-
+independent) `cache/`, so an incremental run from `10k` → `50k` only
+hits the network for genuinely new content.
+
+### RQ5 — capability
+
+> *On the 4 776 unpatched (fix, branch) gap pairs, how often does
+> WORKFLOWBP produce a scanner-verified patch?*
+
+```bash
+export DATASET_TAG=50k
+.venv/bin/python -m analysis_tools.rq5_capability --run
+#   Re-aggregate without re-running:
+.venv/bin/python -m analysis_tools.rq5_capability
+#   Smoke test:
+.venv/bin/python -m analysis_tools.rq5_capability --run --limit 20
+```
+
+Drives `backport_ir backport --oracle` over the full gap set and buckets
+each pair by oracle verdict (`accepted`, `needs_review_only`,
+`no_landed_edits`, `failed_zizmor_local`, `failed_actionlint`, …).
+
+Outputs (under `reports/$DATASET_TAG/`):
+- `rq5_outcome_buckets.md` — per-bucket summary
+- `rq5_per_rule.md` — acceptance rate per zizmor rule
+- `rq5_rows.jsonl` — one row per pair
+
+### RQ6 — historical reproducibility
+
+> *On the 242 confirmed true backports, does WORKFLOWBP's output match
+> what the maintainer actually wrote?*
+
+```bash
+.venv/bin/python -m analysis_tools.rq6_reproducibility
+#   Smoke test:
+.venv/bin/python -m analysis_tools.rq6_reproducibility --limit 10
+#   Re-aggregate without re-fetching:
+.venv/bin/python -m analysis_tools.rq6_reproducibility --aggregate-only
+```
+
+For each true-backport pair fetches the release-branch file immediately
+before (`target_before`) and at (`target_after`, the ground truth) the
+maintainer's backport commit, then compiles the master fix into a WSP,
+applies it to `target_before`, and classifies the result:
+
+- **byte_equal** — byte-for-byte identical to the maintainer's patch
+- **ast_equal** — identical after ruamel round-trip (whitespace/order normalised)
+- **effect_equal** — both candidates pass `zizmor_local` + `actionlint`
+- **divergent** — otherwise
+
+Outputs (under `reports/$DATASET_TAG/`):
+- `rq6_summary.md`, `rq6_rows.jsonl`
+- `rq6/cases/<key>/{target_before,target_after_maintainer,our_patched}.yml`
+  for hand inspection of any divergent case
+
+### RQ7 — baseline comparison
+
+> *How does WORKFLOWBP compare against verbatim copy-paste,
+> Dependabot-style single-dependency updates, and an LLM baseline?*
+
+```bash
+# Three baselines (no LLM)
+.venv/bin/python -m analysis_tools.rq7_comparison \
+    --baselines workflowbp copy_paste dependabot
+# Add the LLM baseline (needs ANTHROPIC_API_KEY in .env)
+.venv/bin/python -m analysis_tools.rq7_comparison \
+    --baselines workflowbp copy_paste dependabot llm
+```
+
+Baselines live in [`analysis_tools/baselines/`](analysis_tools/baselines/):
+
+| Module | What it does |
+|---|---|
+| [`copy_paste`](analysis_tools/baselines/copy_paste.py) | Unified `(source_before -> source_after)` diff applied to `target_before` via a 3-way merge; fails when the pre-image can't be located on the drifted target. |
+| [`dependabot_style`](analysis_tools/baselines/dependabot_style.py) | Extracts only `uses:` upgrades from the source diff and applies each as a single-dependency edit; ignores permissions/with/persist-credentials by construction. |
+| [`llm`](analysis_tools/baselines/llm.py) | Calls Claude with `(source_before, source_after, target_before)` and asks for the patched release-branch YAML; every `actions/<owner>/<repo>@<40-hex>` in the response is checked against the live GitHub API and fabricated SHAs are reported separately. Responses cached in `cache/llm/` keyed by sha256 of the full prompt, so re-runs across dataset tags pay zero API tokens. |
+
+Outputs (under `reports/$DATASET_TAG/`):
+- `rq7_summary.md` — per-baseline accepted / failed table
+- `rq7_llm_hallucination.md` — fabricated-vs-real SHA pin count (LLM only)
+- `rq7_rows.jsonl` — one row per pair, with per-baseline buckets
+
+### Acceptance criterion
+
+All three RQs judge correctness through the same two external oracles
+(`zizmor_local` + `actionlint`) used by `backport_ir backport --oracle`.
+This is the symmetric form of the §III clean-fix criterion
+`V_fixed ≠ ∅ ∧ V_introduced = ∅`, now applied to the release-branch
+transition rather than master's. No script ever asks the engine itself
+to grade its output — that would be circular.
+
+### Reports layout
+
+```
+analysis_tools/reports/
+└── 50k/
+    ├── rq5_outcome_buckets.md   rq5_per_rule.md   rq5_rows.jsonl
+    ├── rq6_summary.md           rq6_rows.jsonl
+    │   └── rq6/cases/<key>/{target_before,target_after_maintainer,our_patched}.yml
+    └── rq7_summary.md           rq7_llm_hallucination.md   rq7_rows.jsonl
+```
+
+The whole `analysis_tools/reports/` tree is gitignored — checked-in
+reports would drift out of sync with re-runs. The `cache/` tree is also
+gitignored but persists between runs to avoid re-paying for fetches and
+LLM calls.
+
 ### Results walkthrough (50k sample)
 
 Every number reported below is reproducible by running the corresponding
-analysis script on the current `output/`. Each entry below states:
+analysis script with `DATASET_TAG=50k`, i.e. against `output/50k/`. Each
+entry below states:
 **what the number means**, **what filter produced it**, **which input file
 it comes from**, and **which script prints it**.
 
@@ -599,11 +763,11 @@ prefix — re-running with a higher `n` only ADDS commits.
 **`file-diffs = 75 158`**
 For each sampled commit, every workflow file modified by it produces one
 file-diff (so most commits contribute 1, some contribute several).
-Source: `output/diffs.jsonl`.
+Source: `output/50k/diffs.jsonl`.
 
 **`scanned blobs = 144 947`**
 The union of `file_hash` and `previous_file_hash` across all file-diffs.
-Each blob is fed to zizmor via stdin once. Source: `output/scans.jsonl`.
+Each blob is fed to zizmor via stdin once. Source: `output/50k/scans.jsonl`.
 
 **`commits with V_fixed ≠ ∅ = 7 629`**
 A commit's `V_fixed` is the set of `(rule_ident, yaml_route)` pairs that
@@ -640,7 +804,7 @@ Two-level clustering over the 1 804 clean fixes (script: **02**):
   sketch collapses specific SHAs / tags to `<sha>` / `<tag>` so a version
   bump on different versions is the same sub-cluster.
 
-Source: `output/patterns.jsonl`.
+Source: `output/50k/patterns.jsonl`.
 
 **Structural uniqueness ratio = 0.93**
 Defined as `n_subclusters / n_commits` over the whole catalog. Near 1
@@ -668,7 +832,7 @@ excessive-permissions, unpinned-uses}` triple. Script: **02**.
 #### C. Match generalization — does the catalog cover unseen commits?
 
 Built an out-of-sample evaluation set: `sample --n-commits 2000 --seed 99`
-→ `diffs` → `scan` → 68 clean-fix commits (`output/eval_diffs.jsonl`).
+→ `diffs` → `scan` → 68 clean-fix commits (`output/50k/eval_diffs.jsonl`).
 
 | Outcome | Definition | Count | % |
 |---|---|---:|---:|
@@ -698,7 +862,7 @@ on each branch's HEAD. Branch classification (`backport_gaps find-gaps`):
 - **already_fixed**: branch has none of those idents (file is "clean")
 - **inapplicable**: file does not exist on the branch
 
-Source: `output/backport_gaps/gaps.jsonl`. Script: **04**.
+Source: `output/50k/backport_gaps/gaps.jsonl`. Script: **04**.
 
 **Branch-level counts (10 862 release branches across 1 789 status-ok commits)**
 
@@ -792,7 +956,7 @@ status by lag sign:
 | `never_had_it` | scanned full history; finding never present | 81 | 4.7% |
 | `timed_out` | per-record 16-min budget exhausted | 118 | 6.9% |
 
-Script: **05**. Source: `output/backport_gaps/gaps_with_history.jsonl`.
+Script: **05**. Source: `output/50k/backport_gaps/gaps_with_history.jsonl`.
 
 Within each master commit, the per-branch history walks run on a
 `ThreadPoolExecutor` (default 8 workers). The per-record budget was

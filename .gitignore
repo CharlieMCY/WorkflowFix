@@ -3,7 +3,9 @@ workflows/
 workflows.csv
 workflows.tar.gz
 output/
-output_10k_full/
+artifacts/
+cache/
+analysis_tools/reports/
 *.pyc
 __pycache__/
 .env

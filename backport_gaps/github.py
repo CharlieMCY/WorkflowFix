@@ -120,7 +120,19 @@ class GitHubClient:
         return r.json() if r.status_code == 200 else None
 
     def get_file_at_ref(self, repo: str, path: str, ref: str) -> tuple[bytes, str] | None:
-        """Return (content_bytes, blob_sha) at `ref`, or None if 404."""
+        """Return (content_bytes, blob_sha) at `ref`, or None if 404.
+
+        Routes through `common.cache.github_file_cached_fetch` so a
+        previous run (possibly under a different DATASET_TAG) for the
+        same (repo, ref, path) is served from local cache instead of
+        re-hitting GitHub. On miss the cache layer calls
+        `_get_file_at_ref_uncached` below.
+        """
+        from common.cache import github_file_cached_fetch
+        return github_file_cached_fetch(self, repo, path, ref)
+
+    def _get_file_at_ref_uncached(self, repo: str, path: str, ref: str) -> tuple[bytes, str] | None:
+        """The bare GitHub API call. Cache layer invokes this on miss."""
         r = self._get(
             f"/repos/{repo}/contents/{path}",
             params={"ref": ref},

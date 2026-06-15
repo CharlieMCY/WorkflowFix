@@ -17,13 +17,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+import os
+
 from common.dataset import output_dir, reports_dir
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = output_dir()
 CLEAN_FIXES_DIR = OUTPUT_DIR / "clean_fixes"
-GAPS_FILE = OUTPUT_DIR / "backport_gaps" / "gaps.jsonl"
-HISTORY_FILE = OUTPUT_DIR / "backport_gaps" / "gaps_with_history.jsonl"
+
+# GAPS_VARIANT selects which gap-audit file to read. Default (empty) =
+# the full audit set; "structural" picks the §III-B-filtered subset.
+_GAPS_VARIANT = os.environ.get("GAPS_VARIANT", "").strip()
+_SUFFIX = f"_{_GAPS_VARIANT}" if _GAPS_VARIANT else ""
+GAPS_FILE = OUTPUT_DIR / "backport_gaps" / f"gaps{_SUFFIX}.jsonl"
+HISTORY_FILE = OUTPUT_DIR / "backport_gaps" / f"gaps_with_history{_SUFFIX}.jsonl"
 
 REPORTS_DIR = reports_dir()
 
@@ -105,26 +112,42 @@ def iter_gap_pairs() -> Iterator[dict]:
 
 
 def iter_true_backports() -> Iterator[dict]:
-    """Yield each (commit, release_branch) that classified as true_backport."""
+    """Yield one row per (commit, release_branch, file) classified as
+    true_backport (lag > 1 day on `confirmed_backport`).
+
+    The boundary commit SHA lives per-file in `history_classifications`;
+    we yield one row per per-file classification so RQ6 can fetch the
+    pre-/post-backport file states without ambiguity.
+    """
+    from backport_gaps.history import _refine_backport_status
+
     if not HISTORY_FILE.exists():
         raise FileNotFoundError(
             f"{HISTORY_FILE} missing — run `python -m backport_gaps classify-history` first."
         )
     for line in HISTORY_FILE.open("r", encoding="utf-8"):
         rec = json.loads(line)
+        if rec.get("status") != "ok":
+            continue
         for afb in rec.get("already_fixed_branches", []):
-            hist = afb.get("history", {})
-            if hist.get("refined_status") != "true_backport":
+            if _refine_backport_status(afb) != "true_backport":
                 continue
-            yield {
-                "repository": rec["repository"],
-                "commit_hash": rec["commit_hash"],
-                "target_idents": rec.get("V_fixed_idents", []),
-                "branch": afb["branch"],
-                "branch_head_sha": afb.get("branch_head_sha", ""),
-                "backport_commit_sha": hist.get("removal_commit_sha", ""),
-                "lag_days": hist.get("lag_days"),
-            }
+            for hc in afb.get("history_classifications", []):
+                if hc.get("status") != "confirmed_backport":
+                    continue
+                bp_sha = hc.get("backport_commit_sha", "")
+                if not bp_sha:
+                    continue
+                yield {
+                    "repository": rec["repository"],
+                    "commit_hash": rec["commit_hash"],
+                    "target_idents": rec.get("V_fixed_idents", []),
+                    "branch": afb["branch"],
+                    "branch_head_sha": afb.get("branch_head_sha", ""),
+                    "file_path": hc.get("file_path", ""),
+                    "backport_commit_sha": bp_sha,
+                    "lag_days": hc.get("lag_days"),
+                }
 
 
 # ---------- oracle wrapper --------------------------------------------------

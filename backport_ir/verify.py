@@ -180,23 +180,36 @@ def zizmor_oracle(
 
 
 def _scope_prefix(route: str) -> str:
-    """Return the deepest 'step / job / root' boundary for a YAML route.
+    """Return the deepest 'step / service / job / root' boundary for a YAML route.
 
     The locality oracle judges each landed edit only on findings within its
     workflow-semantic neighbourhood. zizmor's rules report at varying
     granularity — artipacked at a step, excessive-permissions at a job or
-    root, unpinned-uses at a uses line — so we collapse a route to the
-    nearest enclosing scope unit before comparison:
+    root, unpinned-uses at a uses line, unpinned-images at a service — so
+    we collapse a route to the nearest enclosing scope unit before
+    comparison:
 
-        jobs.X.steps[2].run            -> jobs.X.steps[2]
-        jobs.X.steps[2]                -> jobs.X.steps[2]
-        jobs.X.permissions.contents    -> jobs.X
-        jobs.X                         -> jobs.X
-        permissions.contents           -> '' (root)
-        permissions                    -> '' (root)
+        jobs.X.steps[2].run                       -> jobs.X.steps[2]
+        jobs.X.steps[2]                           -> jobs.X.steps[2]
+        jobs.X.services.svc.image                 -> jobs.X.services.svc
+        jobs.X.services.svc                       -> jobs.X.services.svc
+        jobs.X.permissions.contents               -> jobs.X
+        jobs.X                                    -> jobs.X
+        permissions.contents                      -> '' (root)
+        permissions                               -> '' (root)
+
+    Services need their own scope so an unrelated finding on a sibling
+    service (e.g. `services.oracle.image` unpinned) doesn't fail the
+    oracle for an edit that landed on a different service (e.g.
+    `services.dynamodb_emulator.image`) — master may have targeted only
+    one of them.
     """
     # deepest .steps[N] gives the step scope
     m = re.search(r"^(.*?\.steps\[\d+\])", route)
+    if m:
+        return m.group(1)
+    # else a service under a job gets its own scope
+    m = re.match(r"^(jobs\.[^.\[]+\.services\.[^.\[]+)", route)
     if m:
         return m.group(1)
     # else the deepest jobs.X gives the job scope

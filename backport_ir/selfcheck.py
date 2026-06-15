@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from .apply import apply_program
 from .compile import compile_program
-from .verify import actionlint_oracle, check_postconditions
+from .verify import _scope_prefix, actionlint_oracle, check_postconditions
 
 _SHA = "a" * 40
 
@@ -156,6 +156,27 @@ def run() -> tuple[bool, list[str]]:
           "secrets-inherit: 'inherit' keyword removed")
     check("secrets:" in sec_patched,
           "secrets-inherit: 'secrets:' key survives (not deleted)")
+
+    # ---- unit: _scope_prefix boundaries (steps / services / job / root) ----
+    # Regression guard for the spanner-migration-tool failure: an edit on
+    # `services.dynamodb_emulator.image` MUST scope to that service, not
+    # the whole job, so an unrelated `services.oracle.image` finding on a
+    # sibling service can't fail the oracle.
+    scope_cases = [
+        ("jobs.X.steps[2].run",                  "jobs.X.steps[2]"),
+        ("jobs.X.steps[2]",                      "jobs.X.steps[2]"),
+        ("jobs.integration-tests.services.dynamodb_emulator.image",
+                                                  "jobs.integration-tests.services.dynamodb_emulator"),
+        ("jobs.integration-tests.services.oracle.image",
+                                                  "jobs.integration-tests.services.oracle"),
+        ("jobs.X.permissions.contents",          "jobs.X"),
+        ("jobs.X",                               "jobs.X"),
+        ("permissions.contents",                 ""),
+        ("permissions",                          ""),
+    ]
+    for route, want in scope_cases:
+        got = _scope_prefix(route)
+        check(got == want, f"_scope_prefix({route!r}) -> {got!r} (want {want!r})")
 
     # ---- external oracle: actionlint on the V1+V2 patched output ----
     # The patched workflow from the core scenario must still pass actionlint

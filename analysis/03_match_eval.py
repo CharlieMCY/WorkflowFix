@@ -19,12 +19,13 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import json
 from pathlib import Path
+from common.dataset import output_dir
 
 from pattern_miner.clean_fixes import aggregate_commits, filter_clean_fixes
 from pattern_miner.match import load_pattern_index, match_commit
 from pattern_miner.scan import load_scans
 
-OUT = Path("output")
+OUT = output_dir()
 
 
 def main() -> None:

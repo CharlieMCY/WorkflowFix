@@ -13,3 +13,4 @@ output/50k/backport_ir/
 output/50k/clean_fixes/
 output/50k/diffs.jsonl
 output/50k/scans.jsonl
+output/full/

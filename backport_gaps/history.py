@@ -199,6 +199,94 @@ def _classify_one_branch(
     return per_file
 
 
+def classify_record(
+    client: GitHubClient,
+    rec: dict,
+    master_date_cache: dict | None = None,
+    max_workers: int = MAX_WORKERS_PER_RECORD,
+) -> dict:
+    """Augment one gap-audit record in place with per-branch history
+    classification (the same logic the `run()` driver applies to each
+    record in gaps.jsonl). Returns the augmented `rec`.
+
+    Used by `backport_gaps.stream_all` so history classification can run
+    immediately after each gap audit during a streaming end-to-end pass.
+    """
+    if master_date_cache is None:
+        master_date_cache = {}
+
+    if rec.get("status") != "ok" or not rec.get("already_fixed_branches"):
+        return rec
+
+    repo = rec["repository"]
+    sha = rec["commit_hash"]
+    target_idents = set(rec.get("V_fixed_idents") or [])
+    target_files = rec.get("target_files") or []
+    t_start = time.time()
+
+    key = (repo, sha)
+    if key not in master_date_cache:
+        try:
+            ci = client.get_commit(repo, sha)
+            master_date_cache[key] = (
+                ci["commit"]["committer"]["date"] if ci else None
+            )
+        except GitHubError:
+            master_date_cache[key] = None
+    master_date = master_date_cache[key]
+    rec["master_commit_date"] = master_date
+
+    timed_out = False
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="hist"
+    )
+    try:
+        futures = {
+            executor.submit(
+                _classify_one_branch,
+                client, repo, br["branch"], target_files,
+                target_idents, master_date, MAX_HISTORY_COMMITS,
+            ): br
+            for br in rec["already_fixed_branches"]
+        }
+        remaining = dict(futures)
+        try:
+            for fut in as_completed(futures, timeout=PER_RECORD_TIMEOUT_S):
+                br = remaining.pop(fut, None)
+                if br is None:
+                    continue
+                try:
+                    per_file = fut.result()
+                except Exception as e:
+                    per_file = [{
+                        "status": "error",
+                        "error": f"{type(e).__name__}: {str(e)[:200]}",
+                        "file_path": "?",
+                    }]
+                br["history_classifications"] = per_file
+                br.update(_summarize_branch(per_file))
+        except FuturesTimeoutError:
+            timed_out = True
+            for fut, br in remaining.items():
+                if fut.done():
+                    try:
+                        per_file = fut.result(timeout=0)
+                        br["history_classifications"] = per_file
+                        br.update(_summarize_branch(per_file))
+                    except Exception:
+                        br["history_classifications"] = []
+                        br["backport_status"] = "timed_out"
+                else:
+                    br["history_classifications"] = []
+                    br["backport_status"] = "timed_out"
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    rec["record_timed_out"] = timed_out
+    rec["record_duration_s"] = round(time.time() - t_start, 1)
+    return rec
+
+
 def run(
     in_path: Path | None = None,
     out_path: Path | None = None,

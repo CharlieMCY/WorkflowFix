@@ -13,10 +13,11 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import json
 from pathlib import Path
+from common.dataset import output_dir
 
 from pattern_miner.scan import diff_findings, load_scans
 
-OUT = Path("output")
+OUT = output_dir()
 
 
 def main() -> None:

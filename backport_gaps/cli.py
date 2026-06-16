@@ -75,7 +75,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="path (default: output/backport_gaps/gaps_with_history.jsonl)")
     sp.set_defaults(func=cmd_history_summary)
 
+    sp = sub.add_parser("stream-all",
+                        help="end-to-end per-commit driver over workflows.csv "
+                             "(scan + clean-fix + structural + gap audit)")
+    sp.add_argument("--workers", type=int, default=8)
+    sp.add_argument("--csv", type=Path, default=Path("workflows.csv"))
+    sp.add_argument("--blobs", type=Path, default=Path("workflows"))
+    sp.add_argument("--no-import-50k", action="store_true",
+                    help="skip the one-time import from output/50k/")
+    sp.add_argument("--progress-every", type=int, default=50)
+    sp.add_argument("--limit", type=int, default=None,
+                    help="cap the number of fresh commits to process (smoke test)")
+    sp.set_defaults(func=cmd_stream_all)
+
     return p
+
+
+def cmd_stream_all(args) -> None:
+    from .stream_all import run as run_stream
+    run_stream(workers=args.workers, csv_path=args.csv, blobs_dir=args.blobs,
+               bootstrap_50k=not args.no_import_50k,
+               progress_every=args.progress_every,
+               limit=args.limit)
 
 
 def main(argv: list[str] | None = None) -> int:

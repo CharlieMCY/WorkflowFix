@@ -14,8 +14,9 @@ from __future__ import annotations
 from collections import defaultdict
 import json
 from pathlib import Path
+from common.dataset import output_dir
 
-OUT = Path("output")
+OUT = output_dir()
 
 
 def main() -> None:

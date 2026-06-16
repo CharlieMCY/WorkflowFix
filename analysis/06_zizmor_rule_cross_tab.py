@@ -19,10 +19,11 @@ from __future__ import annotations
 from collections import Counter
 import json
 from pathlib import Path
+from common.dataset import output_dir
 
 from backport_gaps.history import _refine_backport_status
 
-OUT = Path("output")
+OUT = output_dir()
 CLEAN_FIXES = OUT / "clean_fixes"
 GAPS = OUT / "backport_gaps" / "gaps.jsonl"
 HIST = OUT / "backport_gaps" / "gaps_with_history.jsonl"

@@ -15,7 +15,13 @@ from __future__ import annotations
 
 from .apply import apply_program
 from .compile import compile_program
-from .verify import _scope_prefix, actionlint_oracle, check_postconditions
+from .verify import (
+    _scope_prefix,
+    actionlint_oracle,
+    check_postconditions,
+    minimality_oracle,
+    permissions_oracle,
+)
 
 _SHA = "a" * 40
 
@@ -156,6 +162,108 @@ def run() -> tuple[bool, list[str]]:
           "secrets-inherit: 'inherit' keyword removed")
     check("secrets:" in sec_patched,
           "secrets-inherit: 'secrets:' key survives (not deleted)")
+
+    # ---- regression: v2 job-scoped permissions must NOT fan out (the $JOB bug) ----
+    # Master adds a permissions block to ONE job of a multi-job workflow. v1's
+    # unconstrained $JOB fanned it onto EVERY job (srgn 2->13; juspay stripped
+    # packages from 4 untouched jobs). v2 binds the literal job key, so exactly
+    # the touched job changes and the permissions oracle stays green.
+    multi_before = (
+        "on: push\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "  release-please:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: googleapis/release-please-action@v4\n"
+        "  docker:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    permissions:\n"
+        "      packages: write\n"
+        "    steps:\n"
+        "      - uses: docker/build-push-action@v5\n"
+    )
+    multi_after = multi_before.replace(
+        "  release-please:\n    runs-on: ubuntu-latest\n",
+        "  release-please:\n    runs-on: ubuntu-latest\n"
+        "    permissions:\n      contents: write\n",
+    )
+    multi_prog = compile_program(
+        repository="acme/multi", commit_hash="ab" * 20,
+        source_file=".github/workflows/ci.yml",
+        before_text=multi_before, after_text=multi_after,
+        target_idents=["excessive-permissions"],
+    )
+    multi_patched = apply_program(multi_prog, multi_before).patched_text
+    check(multi_patched.count("permissions:") == 2,
+          f"v2 no-fan-out: exactly 2 permissions blocks (docker + release-please), "
+          f"got {multi_patched.count('permissions:')}")
+    check("packages: write" in multi_patched,
+          "v2 no-strip: untouched docker job keeps its packages:write")
+    mperm = permissions_oracle(multi_prog, multi_before, multi_patched)
+    check(mperm["success"],
+          f"v2 permissions oracle green on faithful backport "
+          f"(collateral={mperm.get('collateral_perm_changes')})")
+    # And the oracle must FAIL the v1-style fan-out (sanity: it actually catches it).
+    fanned = multi_before.replace(
+        "  build:\n    runs-on: ubuntu-latest\n",
+        "  build:\n    runs-on: ubuntu-latest\n"
+        "    permissions:\n      contents: write\n",
+    )
+    check(not permissions_oracle(multi_prog, multi_before, fanned)["success"],
+          "v2 permissions oracle FAILS an over-grant to an untouched job")
+
+    # ---- regression: edit-relevance filter (don't replay bundled non-security) ----
+    # A clean-fix commit adds persist-credentials (artipacked) AND incidentally
+    # rewrites a run: body. v1 replayed BOTH, regressing the target's evolved run
+    # script (RQ6 foundry). v2 auto-applies only the security construct; the run
+    # change is flagged for review and left as the target's.
+    rel_before = (
+        "on: push\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - name: build\n"
+        "        run: make TARGET_VERSION\n"
+    )
+    rel_after = (
+        "on: push\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+        "      - name: build\n"
+        "        run: make MASTER_VERSION\n"
+    )
+    rel_prog = compile_program(
+        repository="acme/rel", commit_hash="ee" * 20,
+        source_file=".github/workflows/ci.yml",
+        before_text=rel_before, after_text=rel_after, target_idents=["artipacked"],
+    )
+    rel_patched = apply_program(rel_prog, rel_before).patched_text
+    check("persist-credentials: false" in rel_patched,
+          "filter: security construct (persist-credentials) still auto-applied")
+    check("make TARGET_VERSION" in rel_patched and "make MASTER_VERSION" not in rel_patched,
+          "filter: bundled non-security run: change NOT replayed (no regression)")
+
+    # ---- minimality oracle: NON-circular check that only security changed ----
+    mo_good = minimality_oracle(rel_prog, rel_before, rel_patched)
+    check(mo_good["success"],
+          f"minimality: clean patch changes only security constructs "
+          f"(non_security={mo_good.get('non_security_changes')})")
+    # And it must FLAG a non-security run: change (the regression vector).
+    rel_bad = rel_before.replace("run: make TARGET_VERSION", "run: make MASTER_VERSION")
+    mo_bad = minimality_oracle(rel_prog, rel_before, rel_bad)
+    check(not mo_bad["success"],
+          "minimality: a non-security run: change IS flagged (catches regression)")
 
     # ---- unit: _scope_prefix boundaries (steps / services / job / root) ----
     # Regression guard for the spanner-migration-tool failure: an edit on

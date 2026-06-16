@@ -1,5 +1,25 @@
 # WSP — Workflow Semantic Patch grammar
 
+> **v2 update (job binding).** A bare `$JOB` metavariable used to bind *every*
+> job, so a single-job fix fanned out to all jobs (the over-grant bug: srgn 2→13,
+> juspay stripping `packages:write` from untouched jobs → GHCR 403). v2 replaces it
+> with a **constrained job metavariable declared in the `@@` head**:
+>
+> ```
+> metavariable job $J pin "release-please" recover uses=googleapis/release-please-action bind one
+>
+> jobs.$J.permissions
+> + contents: write
+> ```
+>
+> `pin` is the literal job key the master fix touched (primary identity);
+> `recover uses=<action>` recovers a *renamed* job on the target by a step
+> fingerprint unique to it; `bind one` binds exactly one job — failing closed to
+> review if ambiguous, **never fanning out**. A multi-job fix declares one
+> metavariable per touched job (`$J`, `$J2`, …). The legacy bare `$JOB` below
+> still parses (= `bind each`), but `compile` no longer emits it. Design and
+> rationale in [`GRAMMAR_v2.md`](GRAMMAR_v2.md).
+
 WSP is the Coccinelle/SmPL-flavoured concrete syntax for the `backport_ir` patch
 IR. It is the **single on-disk format**: `compile` writes `.wsp`,
 `apply`/`backport` read it — there is no JSON form of a program. The same text is

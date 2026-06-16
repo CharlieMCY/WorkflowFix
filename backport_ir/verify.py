@@ -415,3 +415,139 @@ def actionlint_oracle(
         "removed": [{"kind": k, "message": m} for (k, m) in sorted(removed)],
         "success": not introduced,
     }
+
+
+# --- external oracle: permissions monotonicity (v2 over-grant guard) ---------
+
+
+def _touched_jobs(program: IRProgram) -> set:
+    """The job keys the program's edits are anchored on. v2 anchors job-scoped
+    edits on a `$J` metavariable pinned to the literal job key (`key_pin`), so
+    this is exact. Also handles a legacy literal job key right under `jobs`."""
+    out: set = set()
+    for e in program.edits:
+        segs = e.anchor.segs
+        for i, s in enumerate(segs):
+            if s.kind == "keyvar" and s.key_pin:
+                out.add(s.key_pin)
+            elif (s.kind == "key" and s.name == "jobs"
+                    and i + 1 < len(segs) and segs[i + 1].kind == "key"):
+                out.add(segs[i + 1].name)
+    return out
+
+
+def _norm_perms(v: Any):
+    """Canonical comparable form of a permissions value (map / scalar shorthand)."""
+    if isinstance(v, dict):
+        return tuple(sorted((str(k), str(val)) for k, val in v.items()))
+    return str(v)
+
+
+def _own_perms(doc: Any, job: str):
+    """A job's OWN permissions block (not root-inherited), or '<none>'.
+
+    The collateral check compares own blocks, NOT root-folded effective
+    permissions: a legitimate *top-level* permissions fix (angular/apollo) is
+    meant to change every job's inherited default, which is intended, not
+    collateral. The over-grant/strip bug always edits job-level OWN blocks
+    (v1 added/removed blocks on untouched jobs), so own-block comparison
+    catches it without false-failing root-level fixes."""
+    jobs = (doc.get("jobs") or {}) if isinstance(doc, dict) else {}
+    body = jobs.get(job)
+    if isinstance(body, dict) and "permissions" in body:
+        return _norm_perms(body["permissions"])
+    return "<none>"
+
+
+def permissions_oracle(
+    program: IRProgram,
+    target_before_text: str,
+    patched_text: str,
+) -> dict[str, Any]:
+    """Guard the v1 over-grant / over-strip bug — invisible to zizmor+actionlint.
+
+    A faithful backport changes permissions ONLY on the jobs the master fix
+    touched. So every job the program did NOT touch must keep its OWN
+    permissions block byte-for-byte. This is exactly what v1 violated: srgn
+    fanned a permissions block onto 12 untouched jobs; juspay stripped
+    `packages:write` from 4 untouched jobs. Both existing oracles reported
+    success on that output; this one fails it. A top-level permissions fix
+    (no job-level block touched) is NOT flagged — changing the inherited
+    default is the point of that fix.
+    """
+    bd = load_safe(target_before_text)
+    ad = load_safe(patched_text)
+    if not isinstance(bd, dict) or not isinstance(ad, dict):
+        return {"status": "scan_error", "error": "permissions: YAML did not parse",
+                "success": True}
+
+    touched = _touched_jobs(program)
+    all_jobs = set((bd.get("jobs") or {})) | set((ad.get("jobs") or {}))
+    collateral = []
+    for j in sorted(all_jobs):
+        if j in touched:
+            continue
+        eb, ea = _own_perms(bd, j), _own_perms(ad, j)
+        if eb != ea:
+            collateral.append({"job": j, "before": eb, "after": ea})
+
+    return {
+        "status": "ok",
+        "touched_jobs": sorted(touched),
+        "collateral_perm_changes": collateral,
+        # success iff no untouched job's OWN permissions block changed.
+        "success": not collateral,
+    }
+
+
+# --- external oracle: minimality / non-regression (NON-circular) -------------
+
+
+def minimality_oracle(
+    program: IRProgram,
+    target_before_text: str,
+    patched_text: str,
+) -> dict[str, Any]:
+    """Did the patch change ONLY security-attributable constructs?
+
+    The strongest signal that does NOT use zizmor at all (so it is not circular
+    with the zizmor-mined fix definition): diff the release file structurally
+    (formatting-insensitive, via the YAML-1.2 loader) and require every changed
+    leaf to be attributable to a security construct of a targeted rule. Catches
+    a backport that silenced the scanner but also reverted the branch's evolved
+    `run:`/`with:`/matrix content (RQ6 foundry) or an apply bug that landed a
+    relevant edit at the wrong path (RQ6 dogtagpki's stray `with.os`).
+    """
+    from .compile import _flatten_text, path_is_security_relevant
+
+    # `patched` is target_before run through ruamel (load -> edits -> dump). ruamel
+    # reserialises some untouched scalars (block-scalar chomping, flow style), which
+    # would leak in as spurious diffs. Cancel that by comparing against target_before
+    # ALSO round-tripped through ruamel with NO edits, so only real edits remain.
+    try:
+        from .apply import dump, load
+        _data, _y = load(target_before_text)
+        baseline_text = dump(_data, _y)
+    except Exception:
+        baseline_text = target_before_text
+
+    before = _flatten_text(baseline_text)
+    after = _flatten_text(patched_text)
+    if not before and not after:
+        return {"status": "scan_error", "error": "minimality: YAML did not parse",
+                "success": True}
+
+    bk, ak = set(before), set(after)
+    changed = (ak - bk) | (bk - ak) | {k for k in ak & bk if before[k] != after[k]}
+    idents = list(program.target_idents)
+    non_security = sorted(p for p in changed
+                          if not path_is_security_relevant(p, idents))
+
+    return {
+        "status": "ok",
+        "n_changed_leaves": len(changed),
+        "n_non_security_changes": len(non_security),
+        "non_security_changes": non_security[:25],
+        # success iff every changed leaf is a security construct of a target rule.
+        "success": not non_security,
+    }

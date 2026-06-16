@@ -87,14 +87,17 @@ def _anchor_str(a: Anchor) -> str:
     return str(a) if a.segs else "."
 
 
-def _parse_anchor(line: str) -> Anchor:
+def _parse_anchor(line: str, metavars: dict | None = None) -> Anchor:
     line = line.strip()
     if line == ".":
         return Anchor([])
+    metavars = metavars or {}
     out: list[Seg] = []
     for s in parse_path(line):
         if s.kind == "key" and s.name.startswith("$"):
-            out.append(Seg.keyvar(s.name[1:]))
+            var = s.name[1:]
+            key_pin, fp, card = metavars.get(var, ("", (), ""))
+            out.append(Seg.jobvar(var, key_pin=key_pin, card=card, fingerprint=fp))
         else:
             out.append(s)
     return Anchor(out)
@@ -124,13 +127,24 @@ def to_wsp(prog: IRProgram) -> str:
         head.append(f"# source: {prog.repository}@{prog.commit_hash} {prog.source_file}")
     if prog.target_idents:
         head.append("fixes " + ", ".join(prog.target_idents))
-    seen_vars: list[str] = []
+    # v2: declare each job metavariable with its binding discipline, so the
+    # "pin the touched job, recover a rename, bind exactly one (never fan out)"
+    # guarantee is visible in the patch a human reviews.
+    declared: dict[str, Seg] = {}
     for e in prog.edits:
         for s in e.anchor.segs:
-            if s.kind == "keyvar" and s.var not in seen_vars:
-                seen_vars.append(s.var)
-    for v in seen_vars:
-        head.append(f"metavariable job ${v}")
+            if s.kind == "keyvar" and s.var not in declared:
+                declared[s.var] = s
+    for var, s in sorted(declared.items()):
+        line = f"metavariable job ${var}"
+        if s.key_pin:
+            line += f' pin "{s.key_pin}"'
+        if s.fingerprint:
+            terms = ", ".join(f"{f}={v}" for (f, v) in s.fingerprint)
+            line += f" recover {terms}"
+        if s.card:
+            line += f" bind {s.card}"
+        head.append(line)
     head.append("@@")
 
     auto = [e for e in prog.edits if not e.review]
@@ -175,6 +189,7 @@ def from_wsp(text: str) -> IRProgram:
 
     repository = commit_hash = source_file = ""
     fixes: list[str] = []
+    metavars: dict[str, tuple] = {}          # var -> (key_pin, fingerprint, card)
     while i < len(lines) and lines[i].strip() != "@@":
         ln = lines[i].strip()
         m = _SOURCE_RE.match(ln)
@@ -182,6 +197,26 @@ def from_wsp(text: str) -> IRProgram:
             repository, commit_hash, source_file = m.group(1), m.group(2), m.group(3)
         elif ln.startswith("fixes "):
             fixes = [x.strip() for x in ln[len("fixes "):].split(",") if x.strip()]
+        elif ln.startswith("metavariable job $"):
+            rem = ln[len("metavariable job $"):]
+            var = rem.split()[0] if rem.split() else ""
+            key_pin = ""
+            mp = re.search(r'pin\s+"([^"]*)"', rem)
+            if mp:
+                key_pin = mp.group(1)
+            card = ""
+            mc = re.search(r'bind\s+(\w+)', rem)
+            if mc:
+                card = mc.group(1)
+            fp: list[tuple] = []
+            if "recover " in rem:
+                rtail = re.sub(r'\s+bind\s+\w+\s*$', '', rem.split("recover ", 1)[1])
+                for t in rtail.split(","):
+                    f, _, v = t.strip().partition("=")
+                    if f and v:
+                        fp.append((f.strip(), v.strip()))
+            if var:
+                metavars[var] = (key_pin, tuple(fp), card)
         i += 1
     i += 1  # past closing @@
 
@@ -232,7 +267,7 @@ def from_wsp(text: str) -> IRProgram:
                 pending.append((sign, rest.strip(), ""))
         else:
             flush()
-            cur = _parse_anchor(raw)
+            cur = _parse_anchor(raw, metavars)
     flush()
 
     return IRProgram(

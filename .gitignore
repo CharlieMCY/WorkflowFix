@@ -14,3 +14,9 @@ output/50k/clean_fixes/
 output/50k/diffs.jsonl
 output/50k/scans.jsonl
 output/full/
+
+# session eval artifacts (generated; not committed)
+demo_out/
+rq5_out/
+rq6_out/
+rq6_cands.json

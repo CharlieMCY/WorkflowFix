@@ -24,6 +24,8 @@ from .ir import IRProgram
 from .verify import (
     actionlint_oracle,
     check_postconditions,
+    minimality_oracle,
+    permissions_oracle,
     zizmor_oracle,
     zizmor_oracle_local,
 )
@@ -243,11 +245,23 @@ def run_backport(
                         prog, target_text, res.patched_text, res,
                     )
                     a = actionlint_oracle(target_text, res.patched_text)
+                    # v2 non-circular guards (do NOT use zizmor):
+                    #   permissions — no untouched job's permissions changed
+                    #                 (catches over-grant/strip).
+                    #   minimality  — the patch changed ONLY security constructs
+                    #                 (catches non-security regression).
+                    perm = permissions_oracle(prog, target_text, res.patched_text)
+                    minim = minimality_oracle(prog, target_text, res.patched_text)
                     row["oracle"] = {
                         "zizmor_global": z_global,
                         "zizmor_local": z_local,
                         "actionlint": a,
-                        "success": bool(z_local.get("success")) and bool(a.get("success")),
+                        "permissions": perm,
+                        "minimality": minim,
+                        "success": (bool(z_local.get("success"))
+                                    and bool(a.get("success"))
+                                    and bool(perm.get("success"))
+                                    and bool(minim.get("success"))),
                     }
                 (d / f"{flat}.report.json").write_text(
                     json.dumps(row, indent=2, ensure_ascii=False))

@@ -37,16 +37,34 @@ from typing import Any
 
 from ._yaml import load_safe
 from .apply import ApplyResult
-from .ir import ENSURE_ABSENT, ENSURE_PRESENT, REWRITE_VALUE, Edit, IRProgram
-from .match import _is_map, resolve
+from .ir import (
+    ENSURE_ABSENT,
+    ENSURE_PRESENT,
+    INSERT_STEP,
+    REMOVE_STEP,
+    REWRITE_VALUE,
+    Edit,
+    IRProgram,
+)
+from .match import _is_map, _is_seq, resolve, step_identity_matches
 
 _PINNED_RE = re.compile(r"@[0-9a-f]{40}$")
+_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 # actionlint entry point in the same venv as this module.
 _ACTIONLINT = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "actionlint"
 
 
 # --- layer 1: structural post-conditions ------------------------------------
+
+
+def _step_ident(step: Any) -> tuple[str, str]:
+    if isinstance(step, dict):
+        for f in ("uses", "id", "name"):
+            v = step.get(f)
+            if isinstance(v, str):
+                return f, (v.partition("@")[0] if f == "uses" else v)
+    return "", ""
 
 
 def _holds(edit: Edit, root: Any) -> bool:
@@ -61,9 +79,25 @@ def _holds(edit: Edit, root: Any) -> bool:
         # Satisfied if no resolved container still carries the key.
         return all(not (_is_map(m.container) and edit.key in m.container)
                    for m in matches)
+    if edit.op == INSERT_STEP:
+        f, v = _step_ident(edit.value)
+        if not f:
+            return True
+        return any(_is_seq(m.container)
+                   and any(step_identity_matches(e, f, v) for e in m.container)
+                   for m in matches)
+    if edit.op == REMOVE_STEP:
+        return all(not (_is_seq(m.container)
+                        and any(step_identity_matches(e, edit.ref_field, edit.ref_value)
+                                for e in m.container))
+                   for m in matches)
     if edit.op == REWRITE_VALUE:
         if not matches:
             return False
+        if edit.pin is not None and edit.pin.kind == "image":
+            return all(isinstance(m.container.get(edit.key), str)
+                       and bool(_DIGEST_RE.search(m.container.get(edit.key)))
+                       for m in matches if _is_map(m.container))
         if edit.pin is not None:
             return all(
                 isinstance(m.container.get(edit.key), str)

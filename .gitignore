@@ -20,3 +20,8 @@ demo_out/
 rq5_out/
 rq6_out/
 rq6_cands.json
+
+llm_full_rows.jsonl
+baseline_full_rows.jsonl
+*.log
+neuro_eval/llm_patches/

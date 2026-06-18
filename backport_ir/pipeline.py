@@ -164,6 +164,79 @@ def make_github_resolver(client) -> Resolver:
     return resolve
 
 
+def make_image_resolver() -> Resolver:
+    """(image_name, tag) -> 'sha256:...' digest via the OCI/Docker registry v2 API.
+
+    Best-effort, anonymous, for the two registries the corpus uses (Docker Hub and
+    ghcr.io). An unresolved digest returns None, so the image-pin edit becomes a
+    `needs_review` item — never a guessed digest. Same contract as the action
+    resolver, so `apply_program(..., image_resolver=...)` can pin unpinned-images."""
+    import requests
+
+    cache: dict[tuple[str, str], "str | None"] = {}
+    _MANIFEST_ACCEPT = ", ".join([
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ])
+
+    def _registry_and_repo(name: str) -> tuple[str, str, str]:
+        parts = name.split("/")
+        if "." in parts[0] or ":" in parts[0] or parts[0] == "localhost":
+            host, repo = parts[0], "/".join(parts[1:])
+            if host in ("docker.io", "index.docker.io"):
+                host = "registry-1.docker.io"
+                if "/" not in repo:
+                    repo = "library/" + repo
+            return host, repo, host
+        repo = name if "/" in name else "library/" + name
+        return "registry-1.docker.io", repo, "registry-1.docker.io"
+
+    def _token(host: str, repo: str) -> "str | None":
+        try:
+            if host == "registry-1.docker.io":
+                r = requests.get(
+                    "https://auth.docker.io/token",
+                    params={"service": "registry.docker.io",
+                            "scope": f"repository:{repo}:pull"}, timeout=20)
+            elif host == "ghcr.io":
+                r = requests.get(f"https://ghcr.io/token",
+                                 params={"scope": f"repository:{repo}:pull"}, timeout=20)
+            else:
+                r = requests.get(f"https://{host}/v2/", timeout=20)
+                return ""        # many registries allow anonymous pull w/o token
+            if r.status_code == 200:
+                return r.json().get("token", "")
+        except Exception:
+            return None
+        return None
+
+    def resolve(name: str, tag: str) -> "str | None":
+        key = (name, tag or "latest")
+        if key in cache:
+            return cache[key]
+        digest = None
+        try:
+            host, repo, _ = _registry_and_repo(name)
+            tok = _token(host, repo)
+            headers = {"Accept": _MANIFEST_ACCEPT}
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
+            url = f"https://{host}/v2/{repo}/manifests/{tag or 'latest'}"
+            r = requests.head(url, headers=headers, timeout=20, allow_redirects=True)
+            if r.status_code != 200:
+                r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                digest = r.headers.get("Docker-Content-Digest")
+        except Exception:
+            digest = None
+        cache[key] = digest
+        return digest
+
+    return resolve
+
+
 def run_backport(
     gaps_path: Path | None = None,
     clean_fixes_dir: Path | None = None,

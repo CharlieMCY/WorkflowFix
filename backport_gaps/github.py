@@ -25,10 +25,18 @@ class GitHubError(RuntimeError):
 
 
 class GitHubClient:
-    def __init__(self, token: str):
+    def __init__(self, token):
+        """`token` may be a single PAT (str), a list of PATs, a TokenPool, or
+        None (use the shared process-wide pool). With multiple tokens the
+        client rotates per request and parks any token that hits its rate
+        limit, multiplying the effective 5000/hr ceiling."""
+        from common.gh_tokens import coerce_pool
+
+        self._pool = coerce_pool(token)
         self._session = requests.Session()
+        # Authorization is set PER REQUEST (the pool rotates tokens); only the
+        # static headers live on the session.
         self._session.headers.update({
-            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": _USER_AGENT,
@@ -54,14 +62,21 @@ class GitHubClient:
     def _get(self, path: str, params: dict | None = None,
              allow_404: bool = False, allow_422: bool = False) -> requests.Response:
         url = path if path.startswith("http") else f"{_BASE}{path}"
-        for attempt in range(4):
+        transient = 0                       # genuine network/5xx/401 retries
+        rotations = 0                       # rate-limit token rotations (cheap)
+        rotation_cap = max(8, (len(self._pool) + 1) * 3)
+        while True:
+            token = self._pool.acquire()    # sleeps only if ALL tokens parked
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
             try:
-                r = self._session.get(url, params=params, timeout=_TIMEOUT)
+                r = self._session.get(url, params=params, timeout=_TIMEOUT,
+                                      headers=headers)
             except (requests.ConnectionError, requests.Timeout) as e:
                 # urllib3 Retry already retried adapter-level; this is a
                 # final fallback so a stubborn network blip doesn't crash.
-                if attempt < 3:
-                    time.sleep(2 ** attempt)
+                transient += 1
+                if transient <= 3:
+                    time.sleep(2 ** transient)
                     continue
                 raise GitHubError(f"GET {url} network error after retries: {e}")
             if r.status_code == 200:
@@ -71,21 +86,33 @@ class GitHubClient:
             if r.status_code == 422 and allow_422:
                 return r
             if r.status_code == 403 and "rate limit" in r.text.lower():
-                reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
-                wait = max(reset - int(time.time()), 1)
-                time.sleep(min(wait, 120))
+                # Park THIS token until its reset and rotate to another one,
+                # instead of blocking the whole run. Honors both primary
+                # (X-RateLimit-Reset) and secondary (Retry-After) limits.
+                retry_after = r.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    reset = time.time() + int(retry_after)
+                else:
+                    reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
+                self._pool.block(token, reset)
+                rotations += 1
+                if rotations > rotation_cap:
+                    raise GitHubError(f"GET {url} -> all tokens rate-limited")
                 continue
             if r.status_code in (502, 503, 504):
-                time.sleep(2 ** attempt)
-                continue
-            if r.status_code == 401 and attempt < 3:
+                transient += 1
+                if transient <= 3:
+                    time.sleep(2 ** transient)
+                    continue
+                raise GitHubError(f"GET {url} -> {r.status_code} after retries")
+            if r.status_code == 401 and transient < 3:
                 # Token is valid (verified separately), so 401 here is
                 # transient — possibly a brief auth-cache desync on the
                 # GitHub side. Back off and try again.
-                time.sleep(2 ** attempt)
+                transient += 1
+                time.sleep(2 ** transient)
                 continue
             raise GitHubError(f"GET {url} -> {r.status_code}: {r.text[:200]}")
-        raise GitHubError(f"GET {url} exhausted retries")
 
     # --- endpoints ------------------------------------------------------
 

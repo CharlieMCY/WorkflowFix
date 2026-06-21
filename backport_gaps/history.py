@@ -38,7 +38,7 @@ from tqdm import tqdm
 
 from pattern_miner.scan import scan_bytes
 
-from .config import GAPS_DIR, get_github_token
+from .config import GAPS_DIR, get_github_tokens
 from .github import GitHubClient, GitHubError
 
 
@@ -305,7 +305,7 @@ def run(
     """
     in_path = in_path or (GAPS_DIR / "gaps.jsonl")
     out_path = out_path or (GAPS_DIR / "gaps_with_history.jsonl")
-    client = GitHubClient(get_github_token())
+    client = GitHubClient(get_github_tokens())
     master_date_cache: dict[tuple[str, str], str | None] = {}
 
     # Build skip set from existing output (resume).

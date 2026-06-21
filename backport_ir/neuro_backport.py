@@ -42,22 +42,27 @@ from .verify import (
 # --- GitHub access ----------------------------------------------------------
 
 
+def _gh_tokens() -> list[str]:
+    """All configured GitHub PATs (env / .env multi-token + gh-cli fallback)."""
+    from common.gh_tokens import load_tokens
+
+    toks = load_tokens(allow_gh_cli=True)
+    if not toks:
+        raise RuntimeError("no GITHUB_TOKEN(S) and `gh auth token` failed")
+    return toks
+
+
 def _gh_token() -> str:
-    tok = os.environ.get("GITHUB_TOKEN", "").strip()
-    if tok:
-        return tok
-    try:
-        tok = subprocess.check_output(["gh", "auth", "token"]).decode().strip()
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("no GITHUB_TOKEN and `gh auth token` failed") from e
-    os.environ["GITHUB_TOKEN"] = tok
-    return tok
+    """First configured PAT (back-compat single-token API)."""
+    return _gh_tokens()[0]
 
 
 def make_client():
     from backport_gaps.github import GitHubClient
 
-    return GitHubClient(_gh_token())
+    # Pass the whole pool so the client rotates tokens and parks rate-limited
+    # ones — N tokens ~= N*5000/hr.
+    return GitHubClient(_gh_tokens())
 
 
 @dataclass

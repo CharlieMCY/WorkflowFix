@@ -245,12 +245,12 @@ def run_backport(
     oracle: bool = False,
 ) -> list[dict]:
     """For each gap branch, fetch its file, replay the matching IR, verify."""
-    from backport_gaps.config import get_github_token
+    from backport_gaps.config import get_github_tokens
     from backport_gaps.github import GitHubClient
 
     gaps_path = gaps_path or GAPS_FILE
     out_dir = out_dir or PATCHES_DIR
-    client = GitHubClient(get_github_token())
+    client = GitHubClient(get_github_tokens())
     resolver = make_github_resolver(client)
     out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -27,7 +27,6 @@ import os
 import urllib.request
 import urllib.error
 
-_TOKEN = os.environ.get("GITHUB_TOKEN", "")  # optional; raises unauth 60/hr -> 5000/hr
 
 from backport_ir.compile import compile_program
 from backport_ir.apply import apply_program
@@ -47,25 +46,44 @@ _parent_cache: dict[tuple[str, str], str | None] = {}
 _ref_cache: dict[tuple[str, str], str | None] = {}
 
 
+from common.gh_tokens import default_pool
+
+_POOL = default_pool()                         # shared token pool (rotates on 403)
+
+
 def _get(url: str, accept: str = "application/vnd.github+json") -> bytes | None:
-    headers = {**UA, "Accept": accept}
-    if _TOKEN:
-        headers["Authorization"] = f"Bearer {_TOKEN}"
-    req = urllib.request.Request(url, headers=headers)
-    for attempt in range(3):
+    transient = 0
+    rotations = 0
+    rotation_cap = max(8, (len(_POOL) + 1) * 3)
+    while True:
+        tok = _POOL.acquire()                  # sleeps only if ALL tokens parked
+        headers = {**UA, "Accept": accept}
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.read()
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
-            if e.code in (403, 429):           # rate-limited: back off once
-                time.sleep(2 + attempt * 3)
+            if e.code in (403, 429):           # rate-limited: park token, rotate
+                ra = e.headers.get("Retry-After")
+                if ra and str(ra).isdigit():
+                    reset = time.time() + int(ra)
+                else:
+                    reset = int(e.headers.get("X-RateLimit-Reset", time.time() + 60))
+                _POOL.block(tok, reset)
+                rotations += 1
+                if rotations > rotation_cap:
+                    return None
                 continue
             return None
         except Exception:
+            transient += 1
+            if transient > 3:
+                return None
             time.sleep(1)
-    return None
 
 
 def raw_file(repo: str, sha: str, path: str) -> str | None:

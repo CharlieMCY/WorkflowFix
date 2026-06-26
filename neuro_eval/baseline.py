@@ -27,7 +27,12 @@ from backport_ir.neuro_backport import (  # noqa: E402
 from backport_ir.pipeline import make_github_resolver  # noqa: E402
 from common.cache import jsonl_already_done, jsonl_append  # noqa: E402
 
-GAPS = Path("output/50k/backport_gaps/gaps_with_history.jsonl")
+# The backport gap set (still-vulnerable fix x branch x file pairs) lives in
+# gaps.jsonl's `gap_branches`, which is all iter_gap_cases reads. gaps.jsonl is
+# therefore the right, minimal source and needs no classify-history step;
+# gaps_with_history.jsonl yields the identical gap set but is only required for
+# RQ6 (true-backport history).
+GAPS = Path("output/50k/backport_gaps/gaps.jsonl")
 OUT = Path("neuro_eval/baseline_rows.jsonl")
 _tls = threading.local()
 

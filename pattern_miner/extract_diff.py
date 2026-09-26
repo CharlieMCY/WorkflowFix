@@ -140,7 +140,12 @@ def flatten_yaml(text: str) -> dict[str, Any]:
     """
     try:
         doc = yaml.safe_load(text)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, ValueError):
+        # ValueError (not a YAMLError) escapes safe_load when the document
+        # contains a scalar PyYAML tries to construct into a Python object
+        # that can't exist — e.g. an out-of-range implicit timestamp like
+        # `BUILD_DATE: 0000-00-00` (-> date(0,0,0) -> "year 0 is out of
+        # range"). Treat it as unparseable and degrade gracefully.
         return {}
     if doc is None:
         return {}

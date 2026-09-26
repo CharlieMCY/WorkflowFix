@@ -1,6 +1,9 @@
 """Minimal GitHub REST client for the operations we need.
 
-Authenticated calls share a 5000/hr rate limit. We log rate-limit headers and
+Each PAT allows 5000 GET/hr. The client draws tokens from a
+common.gh_tokens.TokenPool, rotating per request and parking any token that
+hits its rate limit until the reset, so N tokens give roughly N x 5000/hr
+(modulo GitHub's per-account secondary limit). We log rate-limit headers and
 back off briefly on transient errors. Only public-read endpoints are used.
 """
 from __future__ import annotations

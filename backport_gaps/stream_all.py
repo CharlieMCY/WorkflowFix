@@ -575,7 +575,10 @@ def run(
         # master_date_cache used by classify_history_record across workers
         "_master_date_cache": {},
     }
-    client = GitHubClient(get_github_tokens())
+    tokens = get_github_tokens()
+    client = GitHubClient(tokens)
+    print(f"GitHub client: {len(tokens)} token(s) "
+          f"({'round-robin enabled' if len(tokens) > 1 else 'single-token mode'})")
 
     # Mirror 50k's gaps_with_history.jsonl on first run so 05 can read the
     # combined dataset immediately. The bulk import already mirrored

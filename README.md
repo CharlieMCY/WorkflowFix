@@ -13,8 +13,8 @@ Research questions:
 * **RQ5 (Cost).** What are the cost and latency of WorkflowBP compared with
   general-purpose LLMs?
 
-Section 2 runs RQ1–RQ3, section 3 describes WorkflowBP, and section 4 runs
-RQ4–RQ5.
+Section 2 runs RQ1–RQ3, section 3 describes WorkflowBP, section 4 runs
+RQ4–RQ5, and section 5 lists the LLM prompts and decoding parameters.
 
 ## 1. Setup
 
@@ -213,8 +213,7 @@ There are at most K = 3 rounds, each a fresh `[system, user]` request.
   violations.
 * The model writes only the WSP; the engine applies it and the same oracles
   decide.
-* Prompts: `WSP_GRAMMAR`, `_SYSTEM` and `build_intent` in
-  `backport_ir/llm_adapt.py`.
+* Prompts and decoding parameters: Section 5.
 
 **GitHub API.** Tokens from `GITHUB_TOKENS` / `GITHUB_TOKEN` are rotated per
 request.
@@ -286,15 +285,199 @@ Results reported in the paper:
 | Pure-LLM rewrite (GPT) | 12,000 | 3,954 | 1,158 | |
 | Pure-LLM rewrite (Gemini) | 12,000 | 4,551 | 1,343 | |
 
-**Models and decoding.**
-* Models are called through OpenRouter (`common/llm.py`) as
-  `openai/gpt-5.4-mini` and `google/gemini-3.1-flash-lite`. Each WorkflowBP
-  configuration and its pure-LLM baseline use the same model.
-* Every request sets `temperature = 0` and `max_tokens = 8192`. `top_p` is
-  not set, so the provider default applies.
-* Pure-LLM prompt: `_SYSTEM` and `_prompt` in `neuro_eval/baseline_llm.py`.
-  It gives the targeted rules, the source file before and after the fix,
-  and the target file, and asks for the whole patched file.
+## 5. LLM prompts and decoding parameters
+
+### Decoding parameters
+
+| Parameter | Value |
+|---|---|
+| Endpoint | OpenRouter `/chat/completions` (`LLM_BACKEND=openrouter`, `common/llm.py`) |
+| Models | `openai/gpt-5.4-mini`, `google/gemini-3.1-flash-lite` (each WorkflowBP configuration and its pure-LLM baseline use the same model) |
+| Messages | one system and one user message per request; no conversation history |
+| `temperature` | 0 |
+| `max_tokens` | 8,192 |
+| `top_p`, `seed`, other sampling parameters | not sent (provider defaults) |
+| WSP-synthesis rounds | at most 3 (`--rounds`); stops at the first program that passes the oracles |
+| Baseline rewrite rounds | `--bl-rounds` (default 3); stops at the first accepted file |
+| Target file size | at most 16,000 characters (`--max-chars`) |
+| Output parsing | WSP synthesis: first fenced `wsp` (or `yaml`/`text`) code block; baseline: largest fenced code block that parses as YAML |
+| Request timeout, retries | 180 s; up to 7 attempts, back-off on HTTP 429/5xx and network errors |
+| Response cache | temperature-0 responses cached under `cache/llm/`, keyed by model, system prompt and user prompt |
+
+### WSP-synthesis prompt (LLM fallback, `backport_ir/llm_adapt.py`)
+
+<details><summary>System prompt</summary>
+
+````text
+You are a GitHub Actions security-backport synthesizer. You write a WSP semantic patch (a program); a trusted engine applies it to the target and verifies it. You never edit the target file directly.
+
+WSP semantic-patch syntax (this is what you OUTPUT — a program, not a file). A
+trusted engine parses and APPLIES it to the target, so anchors must resolve
+EXACTLY against the target's real job keys and step identities.
+
+  @@
+  # source: <repo>@<sha> <path>
+  fixes <rule>, <rule>
+  metavariable job $J pin "<exact-job-key-on-target>" bind one
+  @@
+
+  <anchor path>
+  <edit lines>
+
+ANCHORS are semantic paths. `$J` is the job metavariable from the head; it binds
+the job whose key you `pin`. Steps are matched by IDENTITY, never index:
+  jobs.$J.permissions
+  jobs.$J.steps[uses=actions/checkout]          <- selector is the action NAME
+  jobs.$J.steps[uses=actions/checkout].with        ONLY. NEVER include @version:
+  jobs.$J.services.db                              [uses=actions/checkout]  ✓
+                                                   [uses=actions/checkout@v4] ✗
+Also valid step selectors: [id=build], [name=Checkout].
+
+EDIT LINES under an anchor:
+  + key: value          ensure_present (create/set)
+  - key                 ensure_absent (delete)
+  - key: old / + key: new   rewrite (a - and a + on the SAME key, same block)
+  + step before|after [uses=X] = {<json step>}   insert a whole step
+  - step [id=Y]                                  remove a whole step
+
+THE EXACT IDIOMS (copy these shapes):
+
+# unpinned-uses / archived-uses — pin an EXISTING action to a commit SHA. The
+# engine fills the SHA from the marker; do NOT invent one. Selector has NO @ver:
+jobs.$J.steps[uses=actions/checkout]
+- uses: actions/checkout@v4
++ uses: actions/checkout@<sha: pin target_ref>
+
+# artipacked — disable credential persistence on a checkout step:
+jobs.$J.steps[uses=actions/checkout].with
++ persist-credentials: false
+
+# excessive-permissions — add/scope a permissions block on the touched job:
+jobs.$J.permissions
++ contents: read
+
+# unpinned-images — pin an image to its digest (engine fills it):
+jobs.$J.services.db
+- image: postgres:15
++ image: postgres@<sha256: pin digest>
+
+# replace an archived action with a maintained one — remove + insert, do NOT
+# rewrite field-by-field:
+jobs.$J.steps
+- step [uses=actions/old-archived]
++ step after [id=checkout] = {"uses": "maintained/replacement@v2", "with": {...}}
+
+RULES:
+- The engine applies your program literally. If an anchor does not resolve, that
+  edit silently does nothing and the finding stays — so use the target's ACTUAL
+  job key (in `pin`) and ACTUAL action names (in selectors, name only, no @ver).
+- Whole-step add/delete MUST use insert_step/remove_step — you cannot build or
+  delete a step from `+ key`/`- key` leaf lines.
+- For ALL pins write the markers EXACTLY (`<sha: pin target_ref>` for actions,
+  `<sha256: pin digest>` for images); the engine fills the real hash from the
+  target. Never write a literal SHA — you cannot know the correct one.
+- Change ONLY security constructs of the named rule(s); anchor ONLY touched jobs.
+- Output ONE complete .wsp in a single ```wsp code block. Nothing else.
+````
+</details>
+
+<details><summary>User prompt, round 1 (<code>build_intent</code> and <code>llm_backport</code>)</summary>
+
+````text
+TARGET SECURITY RULE(S): {rules}
+
+SECURITY-RELEVANT CHANGE ON MAIN (the intent to reproduce):
+  ADD: {path}  ::  {value}
+  REMOVE: {path}  ::  {value}
+  CHANGE: {path}  ::  {old} -> {new}
+  (the fix is structural — see the job before/after below)      <- only if no leaf above
+
+TOUCHED JOB(S) ON MAIN — before vs after (reproduce ONLY the security change, adapted to the target; ignore unrelated diffs):
+--- job `{job}` BEFORE (main):
+{job YAML before the fix}
+--- job `{job}` AFTER (main):
+{job YAML after the fix}
+
+The compiler auto-derived this TARGET-INDEPENDENT program from the main diff. KEEP the blocks under the head that already apply; the `# --- needs review ---` notes are edits it could NOT place on a drifted target (whole-step add/delete, renamed jobs) — express those concretely (insert_step/remove_step, fixed anchors, pin markers). Return a COMPLETE program that fully applies to THIS target and clears the finding:
+```wsp
+{compiled WSP}
+```
+
+TARGET FILE (release branch `{branch}`, path `{path}`):
+```yaml
+{target file}
+```
+````
+</details>
+
+<details><summary>User prompt, rounds 2–3</summary>
+
+````text
+{round-1 user prompt}
+
+YOUR PREVIOUS PROGRAM was applied by the engine and REJECTED:
+```wsp
+{previous WSP}
+```
+
+COUNTEREXAMPLES from the engine + verifier (fix every one; the engine applies your program literally, so make anchors resolve and edits clear the finding):
+- {counterexample}
+- ...
+
+Return the corrected COMPLETE .wsp in one ```wsp block.
+````
+
+Counterexample kinds: output without a `@@` head, WSP parse error, WSP without
+edit lines, `ANCHOR DID NOT RESOLVE`, `EDIT NOT AUTO-APPLICABLE`, zizmor scan
+error, `SECURITY REGRESSION` (new findings), `FIX NOT ACHIEVED`,
+`WORKFLOW BROKEN (actionlint)`, `COLLATERAL` permission change on an untouched
+job, `NON-MINIMAL` change.
+</details>
+
+### Baseline-rewrite prompt (pure-LLM, `neuro_eval/baseline_llm.py`)
+
+<details><summary>System prompt</summary>
+
+````text
+You backport a security fix for a GitHub Actions workflow. You are given the fix as a before/after pair on the source branch and the current file on a divergent target branch. Output the FULLY PATCHED target file: apply the same security fix, adapted to the target's job names, action versions, and structure. Change only what the security fix requires; leave everything else unchanged. Output ONLY the patched YAML in a single ```yaml code block, with no explanation.
+````
+</details>
+
+<details><summary>User prompt, round 1 (<code>_prompt</code>)</summary>
+
+````text
+Security rules to fix: {rules}
+
+=== SOURCE BEFORE FIX ===
+{source file before the fix}
+=== SOURCE AFTER FIX ===
+{source file after the fix}
+=== TARGET FILE TO PATCH ===
+{target file}
+````
+</details>
+
+<details><summary>User prompt, later rounds (<code>rewrite</code>)</summary>
+
+````text
+{round-1 user prompt}
+
+YOUR PREVIOUS OUTPUT was REJECTED:
+```yaml
+{previous patched file}
+```
+
+FEEDBACK from the verifier (fix every one):
+- {violation}
+- ...
+
+Return the corrected COMPLETE patched file in one ```yaml block.
+````
+
+Feedback kinds: unparseable YAML, zizmor scan error, `SECURITY REGRESSION`,
+`FIX NOT ACHIEVED`, `WORKFLOW BROKEN (actionlint)`, `FABRICATED PIN` (an
+action SHA that does not exist).
+</details>
 
 ---
 

@@ -217,9 +217,6 @@ LLM_BACKEND=openrouter LLM_MODEL=google/gemini-3.1-flash-lite .venv/bin/python -
 .venv/bin/python -m neuro_eval.compare_methods --llm output/full/llm_experiments_gemini/rows.jsonl   # Gemini
 ```
 
-* Sample: cases whose target file exceeds the 16,000-character LLM input
-  limit were replaced by cases of the same class
-  (`neuro_eval/refill_sample.py`, seed 23).
 * `compare_methods` columns: `combined` = WorkflowBP, `symbolic` = symbolic
   engine only, `pureLLM_valid` = pure-LLM baseline (patches whose action pins
   resolve to real commits), `copy_paste`, `dependabot`, `zizmor_fix` =

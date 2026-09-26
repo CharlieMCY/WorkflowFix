@@ -1,12 +1,14 @@
-"""Five-method comparison on the SAME cases (the LLM 12k sample).
+"""Method comparison on the SAME cases (the LLM 12k sample).
 
-copy-paste / dependabot ran on the full gap set; the LLM experiments ran on the
-proportional 12k sample. Same (repo,commit,branch,file) key, so we join: restrict
-the baselines to the sample, intersect with the cases the LLM run has finished,
-and print one four-class table across all five methods on identical cases.
+copy-paste / dependabot ran on the full gap set; the LLM experiments and the
+zizmor --fix baseline ran on the proportional 12k sample. Same
+(repo,commit,branch,file) key, so we join: restrict the baselines to the sample
+(a baseline that failed to fetch a case counts as a failure) and print one
+four-class table across all methods on the 12,000 cases.
 
 Accept criteria (as defined per method elsewhere):
   symbolic / combined : zizmor_local+actionlint+permissions+minimality (IR-local)
+  zizmor_fix          : the same four oracles (baseline_zizmorfix.py)
   pure_LLM / copy_paste / dependabot : route-level (>=1 finding removed, none
                                        introduced) + actionlint  (IR-free)
 """

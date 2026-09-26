@@ -37,6 +37,8 @@ from .compile import parse_path
 from .ir import (
     ENSURE_ABSENT,
     ENSURE_PRESENT,
+    INSERT_STEP,
+    REMOVE_STEP,
     REWRITE_VALUE,
     Anchor,
     Edit,
@@ -46,8 +48,11 @@ from .ir import (
 )
 
 _PIN_MARK = "<sha: pin target_ref>"
+_IMG_MARK = "<sha256: pin digest>"
 _TAG_MARK = "<tag>"
 _SOURCE_RE = re.compile(r"^# source:\s+(\S+)@(\S+)\s+(.+)$")
+_STEP_REF_RE = re.compile(r"\[(\w+)=([^\]]+)\]")
+_WHERES = ("before", "after", "start", "end")
 
 
 # --- scalar literals --------------------------------------------------------
@@ -87,14 +92,17 @@ def _anchor_str(a: Anchor) -> str:
     return str(a) if a.segs else "."
 
 
-def _parse_anchor(line: str) -> Anchor:
+def _parse_anchor(line: str, metavars: dict | None = None) -> Anchor:
     line = line.strip()
     if line == ".":
         return Anchor([])
+    metavars = metavars or {}
     out: list[Seg] = []
     for s in parse_path(line):
         if s.kind == "key" and s.name.startswith("$"):
-            out.append(Seg.keyvar(s.name[1:]))
+            var = s.name[1:]
+            key_pin, fp, card = metavars.get(var, ("", (), ""))
+            out.append(Seg.jobvar(var, key_pin=key_pin, card=card, fingerprint=fp))
         else:
             out.append(s)
     return Anchor(out)
@@ -104,10 +112,19 @@ def _parse_anchor(line: str) -> Anchor:
 
 
 def _render_edit(e: Edit) -> list[str]:
+    if e.op == INSERT_STEP:
+        ref = f" [{e.ref_field}={e.ref_value}]" if e.ref_field else ""
+        where = e.where or "end"
+        return [f"+ step {where}{ref} = {_lit(e.value)}"]
+    if e.op == REMOVE_STEP:
+        return [f"- step [{e.ref_field}={e.ref_value}]"]
     if e.op == ENSURE_PRESENT:
         return [f"+ {e.key}: {_lit(e.value)}"]
     if e.op == ENSURE_ABSENT:
         return [f"- {e.key}"]
+    if e.pin is not None and e.pin.kind == "image":
+        return [f"- {e.key}: {e.pin.action}:{_TAG_MARK}",
+                f"+ {e.key}: {e.pin.action}@{_IMG_MARK}"]
     if e.pin is not None:
         return [f"- {e.key}: {e.pin.action}@{_TAG_MARK}",
                 f"+ {e.key}: {e.pin.action}@{_PIN_MARK}"]
@@ -124,13 +141,24 @@ def to_wsp(prog: IRProgram) -> str:
         head.append(f"# source: {prog.repository}@{prog.commit_hash} {prog.source_file}")
     if prog.target_idents:
         head.append("fixes " + ", ".join(prog.target_idents))
-    seen_vars: list[str] = []
+    # v2: declare each job metavariable with its binding discipline, so the
+    # "pin the touched job, recover a rename, bind exactly one (never fan out)"
+    # guarantee is visible in the patch a human reviews.
+    declared: dict[str, Seg] = {}
     for e in prog.edits:
         for s in e.anchor.segs:
-            if s.kind == "keyvar" and s.var not in seen_vars:
-                seen_vars.append(s.var)
-    for v in seen_vars:
-        head.append(f"metavariable job ${v}")
+            if s.kind == "keyvar" and s.var not in declared:
+                declared[s.var] = s
+    for var, s in sorted(declared.items()):
+        line = f"metavariable job ${var}"
+        if s.key_pin:
+            line += f' pin "{s.key_pin}"'
+        if s.fingerprint:
+            terms = ", ".join(f"{f}={v}" for (f, v) in s.fingerprint)
+            line += f" recover {terms}"
+        if s.card:
+            line += f" bind {s.card}"
+        head.append(line)
     head.append("@@")
 
     auto = [e for e in prog.edits if not e.review]
@@ -175,6 +203,7 @@ def from_wsp(text: str) -> IRProgram:
 
     repository = commit_hash = source_file = ""
     fixes: list[str] = []
+    metavars: dict[str, tuple] = {}          # var -> (key_pin, fingerprint, card)
     while i < len(lines) and lines[i].strip() != "@@":
         ln = lines[i].strip()
         m = _SOURCE_RE.match(ln)
@@ -182,6 +211,26 @@ def from_wsp(text: str) -> IRProgram:
             repository, commit_hash, source_file = m.group(1), m.group(2), m.group(3)
         elif ln.startswith("fixes "):
             fixes = [x.strip() for x in ln[len("fixes "):].split(",") if x.strip()]
+        elif ln.startswith("metavariable job $"):
+            rem = ln[len("metavariable job $"):]
+            var = rem.split()[0] if rem.split() else ""
+            key_pin = ""
+            mp = re.search(r'pin\s+"([^"]*)"', rem)
+            if mp:
+                key_pin = mp.group(1)
+            card = ""
+            mc = re.search(r'bind\s+(\w+)', rem)
+            if mc:
+                card = mc.group(1)
+            fp: list[tuple] = []
+            if "recover " in rem:
+                rtail = re.sub(r'\s+bind\s+\w+\s*$', '', rem.split("recover ", 1)[1])
+                for t in rtail.split(","):
+                    f, _, v = t.strip().partition("=")
+                    if f and v:
+                        fp.append((f.strip(), v.strip()))
+            if var:
+                metavars[var] = (key_pin, tuple(fp), card)
         i += 1
     i += 1  # past closing @@
 
@@ -204,7 +253,12 @@ def from_wsp(text: str) -> IRProgram:
                 plus, minus = "+" in sv, "-" in sv
                 if plus and minus:
                     newv = sv["+"]
-                    if _PIN_MARK in newv:
+                    if _IMG_MARK in newv:
+                        action = newv.split("@", 1)[0].strip()
+                        edits.append(Edit(REWRITE_VALUE, cur, key,
+                                          pin=Pin(action=action, kind="image"),
+                                          expected_old=sv["-"].strip() or None))
+                    elif _PIN_MARK in newv:
                         action = newv.split("@", 1)[0].strip()
                         edits.append(Edit(REWRITE_VALUE, cur, key, pin=Pin(action=action),
                                           expected_old=sv["-"].strip() or None))
@@ -217,6 +271,31 @@ def from_wsp(text: str) -> IRProgram:
                     edits.append(Edit(ENSURE_ABSENT, cur, key))
         pending = []
 
+    def _step_edit(sign: str, rest: str) -> "Edit | None":
+        """Parse a `+ step <where> [f=v] = {..}` / `- step [f=v]` line."""
+        if cur is None:
+            return None
+        body = rest[len("step"):].strip()
+        if sign == "-":
+            m = _STEP_REF_RE.search(body)
+            if not m:
+                return None
+            return Edit(REMOVE_STEP, cur, "step",
+                        ref_field=m.group(1), ref_value=m.group(2).strip())
+        # insert: split placement spec from the JSON step on ' = '
+        spec, _, val = body.partition(" = ")
+        if not val:
+            return None
+        where = ""
+        for w in _WHERES:
+            if re.search(rf"\b{w}\b", spec):
+                where = w
+                break
+        m = _STEP_REF_RE.search(spec)
+        rf, rv = (m.group(1), m.group(2).strip()) if m else ("", "")
+        return Edit(INSERT_STEP, cur, "step", value=_parse_lit(val),
+                    where=where or "end", ref_field=rf, ref_value=rv)
+
     while i < len(lines):
         raw = lines[i]
         i += 1
@@ -225,14 +304,19 @@ def from_wsp(text: str) -> IRProgram:
         if raw.lstrip()[:1] in "+-":
             stripped = raw.lstrip()
             sign, rest = stripped[0], stripped[1:].strip()
-            if ":" in rest:
+            if rest == "step" or rest.startswith("step ") or rest.startswith("step["):
+                flush()                    # keep block ordering before the step op
+                se = _step_edit(sign, rest)
+                if se is not None:
+                    edits.append(se)
+            elif ":" in rest:
                 key, val = rest.split(":", 1)
                 pending.append((sign, key.strip(), val.strip()))
             else:
                 pending.append((sign, rest.strip(), ""))
         else:
             flush()
-            cur = _parse_anchor(raw)
+            cur = _parse_anchor(raw, metavars)
     flush()
 
     return IRProgram(

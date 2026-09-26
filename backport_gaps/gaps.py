@@ -28,7 +28,7 @@ from tqdm import tqdm
 from pattern_miner.scan import scan_bytes
 
 from .branches import filter_release_branches
-from .config import GAPS_DIR, OUTPUT_DIR, get_github_token
+from .config import GAPS_DIR, OUTPUT_DIR, get_github_tokens
 from .github import GitHubClient, GitHubError
 
 
@@ -179,8 +179,7 @@ def run(
     out_path = out_path or (GAPS_DIR / "gaps.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    token = get_github_token()
-    client = GitHubClient(token)
+    client = GitHubClient(get_github_tokens())
 
     metas = list(metas if metas is not None else _clean_fix_meta_paths())
     if limit is not None:

@@ -19,13 +19,72 @@ from dataclasses import dataclass, field
 from io import StringIO
 from typing import Any, Callable
 
-from .ir import ENSURE_ABSENT, ENSURE_PRESENT, REWRITE_VALUE, Edit, IRProgram
-from .match import _is_map, concrete_route, resolve
+from .ir import (
+    ENSURE_ABSENT,
+    ENSURE_PRESENT,
+    INSERT_STEP,
+    REMOVE_STEP,
+    REWRITE_VALUE,
+    Edit,
+    IRProgram,
+)
+from .match import _is_map, _is_seq, concrete_route, resolve, step_identity_matches
 
 # (action, ref) -> 40-hex SHA, or None if it can't be resolved.
 Resolver = Callable[[str, str], "str | None"]
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
+_DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+def _to_ruamel(obj: Any) -> Any:
+    """Convert plain dict/list (e.g. a step parsed from a .wsp) into ruamel
+    Commented types so an inserted step serialises in block style with proper
+    indentation, not as a flow `{...}` blob."""
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
+
+    if isinstance(obj, dict):
+        m = CommentedMap()
+        for k, v in obj.items():
+            m[k] = _to_ruamel(v)
+        return m
+    if isinstance(obj, list):
+        s = CommentedSeq()
+        for v in obj:
+            s.append(_to_ruamel(v))
+        return s
+    return obj
+
+
+def _step_present(seq: Any, step: Any) -> bool:
+    """Idempotency for insert_step: is a step with the same uses/id/name identity
+    already in the list?"""
+    if not isinstance(step, dict):
+        return False
+    for field in ("uses", "id", "name"):
+        v = step.get(field)
+        if isinstance(v, str):
+            val = v.partition("@")[0] if field == "uses" else v
+            if any(step_identity_matches(e, field, val) for e in seq):
+                return True
+    return False
+
+
+def _find_step(seq: Any, field: str, value: str) -> "int | None":
+    for i, e in enumerate(seq):
+        if step_identity_matches(e, field, value):
+            return i
+    return None
+
+
+def _insert_index(seq: Any, where: str, field: str, value: str) -> int:
+    if where == "start":
+        return 0
+    if where in ("before", "after") and field:
+        i = _find_step(seq, field, value)
+        if i is not None:
+            return i if where == "before" else i + 1
+    return len(seq)                          # 'end' / unanchored / ref not found
 
 
 def load(text: str):
@@ -137,7 +196,18 @@ def _site_for(m, edit: Edit) -> str:
     return concrete_route(full_path)
 
 
-def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome:
+def _split_image(ref: str) -> tuple[str, str]:
+    """`ghcr.io/o/r:tag` -> ('ghcr.io/o/r', 'tag'). Tag defaults to 'latest'."""
+    base = ref.split("@", 1)[0]
+    last = base.rsplit("/", 1)[-1]
+    if ":" in last:
+        name, tag = base.rsplit(":", 1)
+        return name, tag
+    return base, "latest"
+
+
+def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None,
+                image_resolver: Resolver | None = None) -> EditOutcome:
     if edit.review:
         return EditOutcome(edit.describe(), edit.op, "needs_review", 0, edit.review)
 
@@ -179,10 +249,44 @@ def _apply_edit(root: Any, edit: Edit, resolver: Resolver | None) -> EditOutcome
                 del cont[edit.key]
                 sites += 1
 
+        elif edit.op == INSERT_STEP:
+            # cont is the resolved `steps` list. Idempotent: skip if a step with
+            # the same identity already exists.
+            if not _is_seq(cont):
+                continue
+            if _step_present(cont, edit.value):
+                continue
+            idx = _insert_index(cont, edit.where, edit.ref_field, edit.ref_value)
+            cont.insert(idx, _to_ruamel(edit.value))
+            sites += 1
+
+        elif edit.op == REMOVE_STEP:
+            if not _is_seq(cont):
+                continue
+            i = _find_step(cont, edit.ref_field, edit.ref_value)
+            if i is not None:               # absent => already satisfied (noop)
+                del cont[i]
+                sites += 1
+
         elif edit.op == REWRITE_VALUE:
             if not _is_map(cont) or edit.key not in cont:
                 continue
-            if edit.pin is not None:
+            if edit.pin is not None and edit.pin.kind == "image":
+                cur = cont.get(edit.key)
+                if isinstance(cur, str) and _DIGEST_RE.search(cur):
+                    continue            # already digest-pinned
+                name, tag = _split_image(str(cur)) if isinstance(cur, str) else ("", "")
+                digest = image_resolver(name, tag) if (image_resolver and name) else None
+                if not digest:
+                    review = True
+                    reasons.append(f"unresolved image digest {name}:{tag or '?'}")
+                    continue
+                newval = f"{name}@{digest}"
+                if cont.get(edit.key) != newval:
+                    cont[edit.key] = newval
+                    sites += 1
+                    _try_eol_comment(cont, edit.key, tag)
+            elif edit.pin is not None:
                 cur = cont.get(edit.key)
                 ref = str(cur).rpartition("@")[2] if (isinstance(cur, str) and "@" in cur) else ""
                 if _SHA_RE.fullmatch(ref):
@@ -222,10 +326,11 @@ def apply_program(
     program: IRProgram,
     target_text: str,
     resolver: Resolver | None = None,
+    image_resolver: Resolver | None = None,
 ) -> ApplyResult:
     """Replay `program` onto `target_text`. Returns patched text + per-edit report."""
     data, y = load(target_text)
-    outcomes = [_apply_edit(data, e, resolver) for e in program.edits]
+    outcomes = [_apply_edit(data, e, resolver, image_resolver) for e in program.edits]
     patched = dump(data, y)
     return ApplyResult(patched_text=patched,
                        target_idents=list(program.target_idents),

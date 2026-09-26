@@ -52,6 +52,22 @@ def step_identity_matches(elem: Any, kind: str, value: str) -> bool:
     return False  # anon — not reliably matchable across drift
 
 
+def _job_matches_fp(jobval: Any, fingerprint: tuple) -> bool:
+    """Does a job satisfy a discriminating fingerprint — i.e. carry every `uses=`
+    action the fingerprint names? Used to recover a renamed job on the target."""
+    uses_terms = [v for (f, v) in fingerprint if f == "uses"]
+    if not uses_terms or not _is_map(jobval):
+        return False
+    steps = jobval.get("steps")
+    if not _is_seq(steps):
+        return False
+    have = set()
+    for st in steps:
+        if _is_map(st) and isinstance(st.get("uses"), str):
+            have.add(st["uses"].partition("@")[0])
+    return all(v in have for v in uses_terms)
+
+
 @dataclass
 class AnchorMatch:
     """One resolution candidate for an anchor against the target tree."""
@@ -93,6 +109,37 @@ def concrete_route(path: list[tuple[str, Any]]) -> str:
     return ".".join(parts).replace(".[", "[")
 
 
+def _bind_jobvar(seg: Seg, node: dict, m: "AnchorMatch", rest: list,
+                 nxt: list) -> None:
+    """v2 job-metavariable binding: literal pin first, then fingerprint recovery,
+    gated by cardinality. ``bind one`` (the compiled default; emitted whenever the
+    metavar carries a ``pin``) binds exactly one job — or holds ambiguous matches
+    for review (weak) — and NEVER fans out. A pin-less keyvar (legacy ``$JOB`` /
+    ``bind each``) keeps the old fan-to-every-job behaviour."""
+    def emit(jobname: str, jobval: Any, weak: bool) -> None:
+        b = dict(m.bindings)
+        b[seg.var or "JOB"] = jobname
+        nxt.append(AnchorMatch(jobval, rest, m.matched_step, b, weak,
+                               m.path + [("key", jobname)]))
+
+    if seg.key_pin:                          # bind one (pinned)
+        if seg.key_pin in node and _is_map(node[seg.key_pin]):
+            emit(seg.key_pin, node[seg.key_pin], m.weak)   # literal pin hit
+            return
+        if seg.fingerprint:                  # pinned job renamed -> recover
+            hits = [(k, v) for k, v in node.items()
+                    if _is_map(v) and _job_matches_fp(v, seg.fingerprint)]
+            weak = m.weak or len(hits) > 1   # ambiguous (>1) -> held for review
+            for k, v in hits:
+                emit(k, v, weak)
+        # no fingerprint / zero hits -> drop: inapplicable, never invented
+        return
+
+    for jobname, jobval in node.items():     # legacy / bind each -> fan out
+        if _is_map(jobval):
+            emit(jobname, jobval, m.weak)
+
+
 def resolve(root: Any, anchor: Anchor) -> list[AnchorMatch]:
     """Return every terminal resolution candidate for `anchor` under `root`."""
     results: list[AnchorMatch] = []
@@ -117,13 +164,7 @@ def resolve(root: Any, anchor: Anchor) -> list[AnchorMatch]:
 
             elif seg.kind == "keyvar":
                 if _is_map(node):
-                    for jobname, jobval in node.items():
-                        if _is_map(jobval):
-                            b = dict(m.bindings)
-                            b[seg.var] = jobname
-                            nxt.append(AnchorMatch(jobval, rest, m.matched_step, b,
-                                                   m.weak,
-                                                   m.path + [("key", jobname)]))
+                    _bind_jobvar(seg, node, m, rest, nxt)
                 # no job to bind -> candidate dies (never invent a job)
 
             elif seg.kind == "list":

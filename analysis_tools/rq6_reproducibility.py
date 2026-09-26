@@ -131,12 +131,12 @@ def classify_one(client, resolver, bp_row: dict, programs: dict,
 
 
 def run(limit: int | None = None, workers: int = 8) -> dict:
-    from backport_gaps.config import get_github_token
+    from backport_gaps.config import get_github_tokens
     from backport_gaps.github import GitHubClient
     from backport_ir.pipeline import iter_clean_fix_programs, make_github_resolver
     from common.cache import jsonl_already_done, jsonl_append
 
-    client = GitHubClient(get_github_token())
+    client = GitHubClient(get_github_tokens())
     resolver = make_github_resolver(client)
     out_dir = REPORTS_DIR / "rq6"
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -104,18 +104,73 @@ def parse_path(path: str) -> list[Seg]:
     return segs
 
 
-def _metavar_jobs(segs: list[Seg]) -> list[Seg]:
-    """Replace the dict key immediately under `jobs` with a `$JOB` metavariable."""
+def _metavar_jobs_v2(
+    segs: list[Seg], job_to_var: dict[str, str], job_fps: dict[str, tuple],
+) -> list[Seg]:
+    """Replace the job key under ``jobs`` with a CONSTRAINED job metavariable.
+
+    v1 emitted a bare ``$JOB`` that bound EVERY job at apply time, so a single-job
+    permissions fix fanned out to all jobs (srgn 2->13, juspay stripping packages
+    from 4 jobs). v2 emits ``$J`` declared ``pin "<job>" recover <fp> bind one``:
+    it binds the literal job key the master fix touched, recovers a renamed job by
+    fingerprint, and ``bind one`` makes it fail-closed — never a fan-out. The
+    declaration is rendered in the ``@@`` head, so the discipline is visible.
+    """
     out: list[Seg] = []
     prev_is_jobs = False
     for s in segs:
         if prev_is_jobs and s.kind == "key":
-            out.append(Seg.keyvar("JOB"))
+            var = job_to_var.get(s.name, "JOB")
+            out.append(Seg.jobvar(var, key_pin=s.name, card="one",
+                                  fingerprint=job_fps.get(s.name, ())))
             prev_is_jobs = False
         else:
             out.append(s)
             prev_is_jobs = s.kind == "key" and s.name == "jobs"
     return out
+
+
+def _job_of_path(path: str) -> str | None:
+    """The job key a flat path belongs to (the key right under `jobs`), or None."""
+    segs = parse_path(path)
+    for i, s in enumerate(segs):
+        if (s.kind == "key" and s.name == "jobs"
+                and i + 1 < len(segs) and segs[i + 1].kind == "key"):
+            return segs[i + 1].name
+    return None
+
+
+def _derive_job_fingerprints(before_doc: Any, after_doc: Any) -> dict[str, tuple]:
+    """Per job, a tuple of discriminating step identities — step ``uses=`` actions
+    that appear in exactly ONE job across the workflow. Used only to recover a
+    renamed job on the target. A job with no globally-unique step ``uses`` gets no
+    fingerprint -> fail-closed (inapplicable) on rename, never a guess (open
+    issue O1: twin/matrix/stepless jobs have no unique fingerprint).
+    """
+    from collections import Counter
+
+    job_uses: dict[str, set] = {}
+    for doc in (after_doc, before_doc):
+        for j, body in ((doc or {}).get("jobs") or {}).items():
+            if j in job_uses or not isinstance(body, dict):
+                continue
+            uses = set()
+            for st in (body.get("steps") or []):
+                if isinstance(st, dict) and isinstance(st.get("uses"), str):
+                    uses.add(st["uses"].partition("@")[0])
+            job_uses[j] = uses
+
+    freq: Counter = Counter()
+    for u in job_uses.values():
+        for a in u:
+            freq[a] += 1
+
+    fps: dict[str, tuple] = {}
+    for j, u in job_uses.items():
+        disc = sorted(a for a in u if freq[a] == 1)
+        if disc:
+            fps[j] = tuple(("uses", a) for a in disc[:2])
+    return fps
 
 
 # --- diff (from raw text, no blob dir needed) -------------------------------
@@ -291,9 +346,10 @@ def _path_removes_whole_list_element(
 
 def _edit_for_leaf(
     path: str, op: str, value: Any = None, old: Any = None,
-    review_reason: str = "",
+    review_reason: str = "", job_fps: dict[str, tuple] | None = None,
+    job_to_var: dict[str, str] | None = None,
 ) -> Edit | None:
-    segs = _metavar_jobs(parse_path(path))
+    segs = _metavar_jobs_v2(parse_path(path), job_to_var or {}, job_fps or {})
     if not segs:
         return None
     last = segs[-1]
@@ -324,6 +380,105 @@ def _edit_for_leaf(
                 review=review_reason)
 
 
+# --- edit-relevance filter --------------------------------------------------
+#
+# A "clean-fix" commit is mined by zizmor (a targeted finding disappeared), but
+# the commit itself is rarely a *surgical* security change — it often also bumps
+# a `run:` script, a `with:` arg, or a matrix entry. v1 compiled a rewrite_value
+# for EVERY changed leaf and replayed all of them, which regresses a release
+# branch's independently-evolved content (RQ6 foundry: 3 run-script bodies
+# reverted to master's older versions; dogtagpki: a stray `with.os` line) while
+# missing the actual fix. So we auto-apply ONLY edits attributable to a known
+# security construct of a TARGETED rule; everything else is flagged for review.
+
+_IDENT_CONSTRUCTS: dict[str, frozenset] = {
+    "excessive-permissions":   frozenset({"permissions"}),
+    "use-trusted-publishing":  frozenset({"permissions"}),
+    "artipacked":              frozenset({"persist-credentials"}),
+    "unpinned-uses":           frozenset({"uses"}),
+    "archived-uses":           frozenset({"uses"}),
+    "unpinned-images":         frozenset({"image"}),
+    "secrets-inherit":         frozenset({"secrets"}),
+    "template-injection":      frozenset({"env", "run"}),
+    "github-env":              frozenset({"run"}),
+    "dangerous-triggers":      frozenset({"on"}),
+    "bot-conditions":          frozenset({"if"}),
+}
+
+
+def _edit_touches(edit: Edit, construct: str) -> bool:
+    """Does this edit operate on `construct` (its key, a uses-pin, or an
+    enclosing anchor key like `permissions`/`secrets`/`env`)?"""
+    if edit.key == construct:
+        return True
+    if construct == "uses" and edit.pin is not None:
+        return True
+    return any(s.kind == "key" and s.name == construct for s in edit.anchor.segs)
+
+
+def _edit_is_relevant(edit: Edit, target_idents: list[str]) -> bool:
+    """True iff the edit touches a security construct of at least one targeted
+    rule. Edits that don't (run bodies, with-args, matrix, …) are non-security
+    and must not be auto-replayed onto a drifted branch."""
+    allowed: set[str] = set()
+    for ident in target_idents:
+        allowed |= _IDENT_CONSTRUCTS.get(ident, frozenset())
+    return any(_edit_touches(edit, c) for c in allowed)
+
+
+def surgical_class(program: IRProgram) -> str:
+    """Is this clean-fix a *surgically backportable* security patch? A
+    master-commit property, independent of any target branch.
+
+    A zizmor finding can disappear for reasons that are NOT a portable patch
+    (a step was deleted, the workflow was refactored, a dependency bump
+    restructured the step). Classify by whether the edits attributable to the
+    targeted rule(s) are construct-local:
+
+      surgical          EVERY security-relevant edit is auto-applicable
+                        (a permissions block, persist-credentials, a uses-pin) —
+                        the engine can place the whole fix on a drifted branch.
+      partial           SOME security edits are auto-applicable, some need step
+                        synthesis/deletion — the engine transplants part of the
+                        fix and flags the rest.
+      restructure       security edits EXIST but ALL need step synthesis/deletion
+                        (the fix lives in adding/removing whole steps) — does not
+                        transplant surgically.
+      no_security_edit  NO construct-local security edit at all — the finding
+                        cleared as a side-effect of restructuring.
+    """
+    sec = [e for e in program.edits
+           if _edit_is_relevant(e, list(program.target_idents))]
+    if not sec:
+        return "no_security_edit"
+    auto = [e for e in sec if not e.review]
+    if len(auto) == len(sec):
+        return "surgical"
+    if auto:
+        return "partial"
+    return "restructure"
+
+
+def surgical_review_reasons(program: IRProgram) -> list[str]:
+    """For a `restructure` program, the review reasons blocking the security
+    edits (e.g. new-list-element vs whole-list-removal)."""
+    return sorted({e.review for e in program.edits
+                   if e.review and _edit_is_relevant(e, list(program.target_idents))})
+
+
+def path_is_security_relevant(path: str, target_idents: list[str]) -> bool:
+    """Path-based form of `_edit_is_relevant`, for the minimality oracle: is a
+    flat identity-keyed leaf path (e.g. `jobs.X.permissions.contents`,
+    `jobs.X.steps[uses=actions/checkout].with.persist-credentials`) attributable
+    to a security construct of a targeted rule? A `[uses=...]` list-identity
+    segment is a step SELECTOR, not a `uses:` value change, so it never counts."""
+    allowed: set[str] = set()
+    for ident in target_idents:
+        allowed |= _IDENT_CONSTRUCTS.get(ident, frozenset())
+    keys = [s.name for s in parse_path(path) if s.kind == "key"]
+    return any(c in keys for c in allowed)
+
+
 # --- top-level --------------------------------------------------------------
 
 
@@ -345,11 +500,25 @@ def compile_program(
     #    and the absent silently wins, deleting the whole `secrets` key.
     before_doc = load_safe(before_text) or {}
     after_doc = load_safe(after_text) or {}
+    # v2: discriminating per-job fingerprint, for recovering a renamed job on the
+    # target. Job edits are anchored on the LITERAL job key (no $JOB fan-out).
+    job_fps = _derive_job_fingerprints(before_doc, after_doc)
     added, removed, extra_changed = _consolidate_type_changes(
         added, removed, before_doc, after_doc,
     )
     for k, v in extra_changed.items():
         changed[k] = v                       # overrides any scalar->scalar entry
+
+    # v2: assign a job metavariable ($J, $J2, ...) per distinct touched job, in a
+    # deterministic order, so multi-job fixes (juspay's 3 jobs) get independent
+    # bindings instead of one collapsed $JOB.
+    touched_jobs = sorted(
+        {j for j in (_job_of_path(p)
+                     for p in list(added) + list(removed) + list(changed))
+         if j is not None}
+    )
+    job_to_var = {j: ("J" if i == 0 else f"J{i + 1}")
+                  for i, j in enumerate(touched_jobs)}
 
     # 2) Pre-compute which paths cross list-element boundaries so we can flag
     #    them at compile time (otherwise the engine produces silently-broken
@@ -371,7 +540,8 @@ def compile_program(
         if _path_introduces_new_list_element(p, before_segs_list):
             reason = ("adds a new list element; the engine cannot "
                       "insert into the target's list")
-        e = _edit_for_leaf(p, ENSURE_PRESENT, value=v, review_reason=reason)
+        e = _edit_for_leaf(p, ENSURE_PRESENT, value=v, review_reason=reason,
+                           job_fps=job_fps, job_to_var=job_to_var)
         if e:
             edits.append(e)
     for p in sorted(removed):
@@ -379,13 +549,25 @@ def compile_program(
         if _path_removes_whole_list_element(p, after_segs_list):
             reason = ("removes a whole list element; the engine cannot "
                       "delete steps without leaving a husk")
-        e = _edit_for_leaf(p, ENSURE_ABSENT, review_reason=reason)
+        e = _edit_for_leaf(p, ENSURE_ABSENT, review_reason=reason,
+                           job_fps=job_fps, job_to_var=job_to_var)
         if e:
             edits.append(e)
     for p, (old, new) in sorted(changed.items()):
-        e = _edit_for_leaf(p, REWRITE_VALUE, value=new, old=old)
+        e = _edit_for_leaf(p, REWRITE_VALUE, value=new, old=old,
+                           job_fps=job_fps, job_to_var=job_to_var)
         if e:
             edits.append(e)
+
+    # 3) Edit-relevance filter: auto-apply only edits attributable to a security
+    #    construct of a targeted rule; flag the rest (non-security run/with/matrix
+    #    changes the clean-fix commit happened to bundle) for human review so they
+    #    never silently regress the release branch's evolved content.
+    for e in edits:
+        if not e.review and not _edit_is_relevant(e, list(target_idents)):
+            e.review = ("non-security change, not attributable to "
+                        f"{', '.join(sorted(target_idents))}; not auto-applied")
+
     return IRProgram(
         repository=repository,
         commit_hash=commit_hash,

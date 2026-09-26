@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,6 +32,25 @@ from .dataset import cache_dir
 
 def _sha(text: str, n: int = 32) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:n]
+
+
+def _atomic_write_text(p: Path, text: str) -> None:
+    """Write `text` to `p` atomically: a concurrent reader (even another
+    process) sees either the old file or the complete new one, never a
+    half-written file. Prevents the json.loads('Expecting value...') races
+    that happen when many workers populate the same cache key at once."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _shard(key: str, depth: int = 2) -> Path:
@@ -124,7 +145,10 @@ def github_commit_get(repo: str, sha: str) -> dict | None:
     to distinguish)."""
     p = _commit_path(repo, sha).with_suffix(".json")
     if p.exists():
-        return json.loads(p.read_text())
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None  # corrupt/truncated entry -> treat as miss, re-fetch
     return None
 
 
@@ -135,8 +159,7 @@ def github_commit_cached_missing(repo: str, sha: str) -> bool:
 
 def github_commit_put(repo: str, sha: str, commit: dict) -> None:
     p = _commit_path(repo, sha).with_suffix(".json")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(commit, ensure_ascii=False))
+    _atomic_write_text(p, json.dumps(commit, ensure_ascii=False))
 
 
 def github_commit_put_missing(repo: str, sha: str) -> None:
@@ -177,32 +200,39 @@ def github_commit_cached_fetch(client, repo: str, sha: str) -> dict | None:
 # --- LLM call cache -------------------------------------------------------
 
 
-def _llm_path(model: str, system: str, user: str) -> Path:
-    key = _sha(f"{model}\n\n{system}\n\n{user}", n=48)
+def _llm_path(model: str, system: str, user: str, salt: str = "") -> Path:
+    base = f"{model}\n\n{system}\n\n{user}"
+    if salt:                       # e.g. "nothink": keep enabled/disabled-think
+        base += f"\n\n{salt}"      # responses in distinct cache slots
+    key = _sha(base, n=48)
     return cache_dir() / "llm" / _shard(key) / "response.json"
 
 
 def llm_call_cached(
     invoke: Callable[[str, str, str], dict[str, Any]],
-    *, model: str, system: str, user: str,
+    *, model: str, system: str, user: str, salt: str = "",
 ) -> dict[str, Any]:
-    """Cache an LLM completion keyed by (model, system, user).
+    """Cache an LLM completion keyed by (model, system, user[, salt]).
 
     `invoke(model, system, user)` is the function that makes the actual
     API call; it should return a dict with at least {"text", "input_tokens",
     "output_tokens"}. The cache layer never makes API calls on its own;
     on cache hit it returns the stored dict, on miss it calls `invoke`
-    and stores the result.
+    and stores the result. `salt` distinguishes otherwise-identical calls
+    made under different request options (e.g. thinking on/off).
     """
-    p = _llm_path(model, system, user)
+    p = _llm_path(model, system, user, salt)
     if p.exists():
-        record = json.loads(p.read_text())
-        record["_cache_hit"] = True
-        return record
+        try:
+            record = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            record = None  # corrupt/truncated entry -> treat as miss, re-invoke
+        if record is not None:
+            record["_cache_hit"] = True
+            return record
     record = invoke(model, system, user)
     record.setdefault("model", model)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(record, ensure_ascii=False))
+    _atomic_write_text(p, json.dumps(record, ensure_ascii=False))
     record["_cache_hit"] = False
     return record
 

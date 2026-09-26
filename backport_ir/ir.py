@@ -37,7 +37,14 @@ from typing import Any
 ENSURE_PRESENT = "ensure_present"
 ENSURE_ABSENT = "ensure_absent"
 REWRITE_VALUE = "rewrite_value"
-OPS = frozenset({ENSURE_PRESENT, ENSURE_ABSENT, REWRITE_VALUE})
+# v3 typed list-element ops — make whole-step add/delete (the `restructure`
+# class) expressible in the DSL so the apply engine can place them on the
+# target. The target-dependent parameters (where to splice, which step to
+# delete) are concrete fields here; a synthesizer (LLM) or compiler fills them.
+INSERT_STEP = "insert_step"
+REMOVE_STEP = "remove_step"
+OPS = frozenset({ENSURE_PRESENT, ENSURE_ABSENT, REWRITE_VALUE,
+                 INSERT_STEP, REMOVE_STEP})
 
 
 # --- anchor segments --------------------------------------------------------
@@ -54,11 +61,24 @@ class Seg:
 
     kind: str
     name: str = ""        # kind=='key'
-    var: str = ""         # kind=='keyvar'  (the paper's job_name placeholder)
+    var: str = ""         # kind=='keyvar'  (the SmPL job metavariable, e.g. $J)
     list_kind: str = ""   # kind=='list': uses|id|name|run|str|scalar|anon
                           #               (the paper's `field` in [field=context])
     value: str = ""       # kind=='list': identity value
                           #               (the paper's `context` in [field=context])
+    # --- v2 keyvar binding discipline (only meaningful when kind=='keyvar') ---
+    key_pin: str = ""
+    """The literal job key the master fix touched — the PRIMARY identity. The
+    metavariable binds this job first (it is always known at compile time)."""
+    card: str = ""
+    """Binding cardinality, SmPL-style: 'one' binds exactly one job (fail-closed
+    to review if ambiguous — never fans out); 'each' fans to every match (the
+    legacy unconstrained $JOB). Empty == legacy 'each'."""
+    fingerprint: tuple = ()
+    """A tuple of (field, value) step identities — e.g. (("uses","actions/checkout"),)
+    that uniquely picks the job on master. Used ONLY as drift recovery when the
+    pinned job key is ABSENT on the target (the release branch renamed the job).
+    Empty == no recovery == fail-closed (inapplicable). A job is NEVER created."""
 
     @staticmethod
     def key(name: str) -> "Seg":
@@ -67,6 +87,14 @@ class Seg:
     @staticmethod
     def keyvar(var: str) -> "Seg":
         return Seg("keyvar", var=var)
+
+    @staticmethod
+    def jobvar(var: str, key_pin: str = "", card: str = "one",
+               fingerprint: tuple = ()) -> "Seg":
+        """A job metavariable bound by literal pin (primary) + fingerprint
+        (rename recovery), with an explicit binding cardinality."""
+        return Seg("keyvar", var=var, key_pin=key_pin, card=card,
+                   fingerprint=fingerprint)
 
     @staticmethod
     def listid(list_kind: str, value: str) -> "Seg":
@@ -108,8 +136,9 @@ class Pin:
     item, never a guess.
     """
 
-    action: str               # e.g. 'actions/checkout'
+    action: str               # e.g. 'actions/checkout' (action) or 'ghcr.io/x/y' (image)
     align: str = "target_ref"
+    kind: str = "action"      # 'action' -> ref->commit SHA; 'image' -> tag->@sha256 digest
 
 
 # --- a single edit ----------------------------------------------------------
@@ -122,20 +151,33 @@ class Edit:
     op: str
     anchor: Anchor
     key: str
-    value: Any = None              # ensure_present / rewrite_value literal
+    value: Any = None              # ensure_present / rewrite_value literal; insert_step: the step mapping
     pin: Pin | None = None         # rewrite_value via version-aligned pin
     expected_old: str | None = None  # rewrite_value: old value sketch (sanity check)
     review: str = ""               # non-empty => not auto-applicable; human must check
+    # --- insert_step / remove_step placement (target-dependent) ---
+    where: str = ""                # 'before' | 'after' | 'start' | 'end'
+    ref_field: str = ""            # identity field of the step to anchor at / remove ('uses'|'id'|'name')
+    ref_value: str = ""            # identity value
+
+    def _ref(self) -> str:
+        return f"[{self.ref_field}={self.ref_value}]" if self.ref_field else ""
 
     def describe(self) -> str:
         """One-line human-readable form, SmPL-ish, for reports."""
         loc = f"{self.anchor}.{self.key}" if str(self.anchor) != "<root>" else self.key
+        if self.op == INSERT_STEP:
+            pos = f" {self.where} {self._ref()}".rstrip()
+            return f"+ {self.anchor}.step{pos} = {self.value!r}"
+        if self.op == REMOVE_STEP:
+            return f"- {self.anchor}.step {self._ref()}".rstrip()
         if self.op == ENSURE_PRESENT:
             return f"+ {loc} = {self.value!r}"
         if self.op == ENSURE_ABSENT:
             return f"- {loc}"
         if self.pin is not None:
-            return f"~ {loc} : pin({self.pin.action} -> target_ref SHA)"
+            tgt = "@sha256 digest" if self.pin.kind == "image" else "target_ref SHA"
+            return f"~ {loc} : pin({self.pin.action} -> {tgt})"
         return f"~ {loc} : -> {self.value!r}"
 
 

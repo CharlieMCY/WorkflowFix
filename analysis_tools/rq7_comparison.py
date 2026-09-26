@@ -120,14 +120,14 @@ def run(
     finish; on re-run we skip any (repo, commit, branch, file) already
     present; the outer loop runs `workers` pairs concurrently.
     """
-    from backport_gaps.config import get_github_token
+    from backport_gaps.config import get_github_tokens
     from backport_gaps.github import GitHubClient
     from backport_ir.pipeline import iter_clean_fix_programs, make_github_resolver
     from common.cache import jsonl_already_done, jsonl_append
 
     from .common import iter_clean_fixes
 
-    client = GitHubClient(get_github_token())
+    client = GitHubClient(get_github_tokens())
     resolver = make_github_resolver(client)
     rows_path = out_dir / "rq7_rows.jsonl"
 

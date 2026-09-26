@@ -4,7 +4,9 @@ The naive "just prompt an LLM" approach, contrasted with WORKFLOWBP. Given the
 master before/after fix and the divergent target file, the model is asked to
 emit the FULLY PATCHED target YAML directly -- no WSP, no engine apply. Same
 Claude Code config as the fallback (LLM_BACKEND=claude_code, stripped system
-prompt, no session transcript, temp-0 cache, sonnet by default).
+prompt, no session transcript, temp-0 cache, sonnet by default). Like the
+fallback, it gets up to --rounds rounds (default 3): a rejected output is sent
+back with the verifier's feedback (see rewrite()).
 
 Two things are measured, both comparable across methods:
   * acceptance -- same route-level criterion as the copy-paste / dependabot
@@ -19,7 +21,7 @@ Two things are measured, both comparable across methods:
 Case universe + transplant class are read from the backport run's
 symbolic_rows.jsonl, so the LLM baseline runs on the SAME cases as WORKFLOWBP and
 is directly comparable. By default a stratified per-class sample is run (a full
-run is one LLM call per case, the most expensive of all methods).
+run is up to --rounds LLM calls per case, the most expensive of all methods).
 
 Usage:
     .venv/bin/python -m neuro_eval.baseline_llm --per-class 500       # sample
@@ -102,19 +104,117 @@ def _pins(text: str) -> set:
     return {(m.group(1), m.group(2).lower()) for m in _PIN40.finditer(text)}
 
 
-def _judge(target_before: str, patched: str, idents) -> bool:
+def _judge_detail(target_before: str, patched: str, idents) -> list[str]:
+    """Violations of the route-level criterion, phrased as feedback for the next
+    round ([] = accepted)."""
     bs = scan_bytes(target_before.encode("utf-8", "replace"))
     ps = scan_bytes(patched.encode("utf-8", "replace"))
-    if not bs.get("ok") or not ps.get("ok"):
-        return False
+    if not bs.get("ok"):
+        return [f"zizmor could not scan the target file: {str(bs.get('error'))[:160]}"]
+    if not ps.get("ok"):
+        return [f"zizmor could not scan your output: {str(ps.get('error'))[:160]} "
+                "— it is not a valid workflow."]
     fixed, introduced = diff_findings(bs["findings"], ps["findings"])
-    if introduced or not any(f["ident"] in idents for f in fixed):
-        return False
+    v: list[str] = []
+    if introduced:
+        v.append("SECURITY REGRESSION: your output INTRODUCED new findings "
+                 f"{sorted({f['ident'] for f in introduced})}. Remove the cause.")
+    if not any(f["ident"] in idents for f in fixed):
+        v.append(f"FIX NOT ACHIEVED: no targeted finding {sorted(idents)} was removed. "
+                 "Apply the security fix to this file.")
     a = actionlint_oracle(target_before, patched)
-    return a.get("status") == "ok" and bool(a.get("success"))
+    if a.get("status") != "ok":
+        v.append(f"actionlint could not check your output ({a.get('where')}): "
+                 f"{str(a.get('error'))[:160]}")
+    elif not a.get("success"):
+        for f in (a.get("introduced") or [])[:6]:
+            v.append(f"WORKFLOW BROKEN (actionlint): [{f.get('kind')}] {f.get('message')}")
+    return v
 
 
-def process(row: dict, max_chars: int) -> dict:
+def _judge(target_before: str, patched: str, idents) -> bool:
+    return not _judge_detail(target_before, patched, idents)
+
+
+def _classify_pins(cl, target_before: str, patched: str) -> dict:
+    """Status of each action SHA the model NEWLY introduced (was a tag on the
+    target, now a 40-hex SHA). correct = matches what the target's OWN ref
+    resolves to (the backport-safe pin). wrong_version = a real SHA but not the
+    target's ref (e.g. master's SHA copied -> silent upgrade). fabricated = no
+    such commit in the action repo. WORKFLOWBP's pin() is correct by design."""
+    tgt_ref = {m.group(1): m.group(2)
+               for m in re.finditer(r"uses:\s*([^\s@#]+)@([^\s#]+)", target_before)}
+    status = {}
+    for action, psha in _pins(patched) - _pins(target_before):
+        try:
+            exists = cl.get_commit(action, psha) is not None
+        except Exception:
+            exists = False
+        if not exists:
+            status[(action, psha)] = "fabricated"
+            continue
+        ref = tgt_ref.get(action)
+        csha = None
+        if ref:
+            try:
+                cm = cl.get_commit(action, ref)
+                csha = (cm or {}).get("sha")
+            except Exception:
+                csha = None
+        status[(action, psha)] = ("correct" if csha and csha.lower() == psha
+                                  else "wrong_version")
+    return status
+
+
+def rewrite(c, idents, *, cl=None, max_rounds: int = 3, max_tokens: int = 8192) -> dict:
+    """Ask the LLM to rewrite the whole target file, up to `max_rounds` rounds.
+
+    Round 1 sends the plain prompt. After a rejected round, the next stateless
+    request re-sends it with the previous output and the verifier's feedback,
+    the same protocol as the fallback's CEGIS loop. A round passes when its
+    output meets the route-level criterion (_judge) and, given `cl`, pins no
+    fabricated action SHA. The returned `patched` is the last round's output."""
+    base_user = _prompt(c)
+    user = base_user
+    out = {"patched": None, "accepted": False, "rounds": 0,
+           "input_tokens": 0, "output_tokens": 0, "history": []}
+    for rnd in range(1, max_rounds + 1):
+        out["rounds"] = rnd
+        resp = llm.complete(_SYSTEM, user, temperature=0.0, max_tokens=max_tokens)
+        out["input_tokens"] += int(resp.get("input_tokens", 0))
+        out["output_tokens"] += int(resp.get("output_tokens", 0))
+        text = resp.get("text", "")
+        patched = _extract_yaml(text)
+        out["patched"] = patched
+        if not patched:
+            viol = ["Your output was not parseable YAML. Output the complete patched "
+                    "file in one ```yaml block."]
+        else:
+            viol = _judge_detail(c.target_text, patched, idents)
+            if cl is not None:
+                viol += [f"FABRICATED PIN: `{a}@{s}` is not a commit of `{a}`. Pin only "
+                         "to commits that exist."
+                         for (a, s), st in sorted(_classify_pins(cl, c.target_text,
+                                                                 patched).items())
+                         if st == "fabricated"]
+        out["history"].append({"round": rnd, "accepted": not viol, "violations": viol})
+        if not viol:
+            out["accepted"] = True
+            return out
+        if rnd == max_rounds:
+            break
+        user = (
+            base_user
+            + "\n\nYOUR PREVIOUS OUTPUT was REJECTED:\n"
+            + "```yaml\n" + (patched or text[:4000]).rstrip() + "\n```\n\n"
+            + "FEEDBACK from the verifier (fix every one):\n"
+            + "\n".join(f"- {x}" for x in viol)
+            + "\n\nReturn the corrected COMPLETE patched file in one ```yaml block."
+        )
+    return out
+
+
+def process(row: dict, max_chars: int, rounds: int = 3) -> dict:
     repo, sha, branch, path = (row["repository"], row["commit_hash"],
                                row["branch"], row["file"])
     base = {"repository": repo, "commit_hash": sha, "branch": branch,
@@ -126,52 +226,24 @@ def process(row: dict, max_chars: int) -> dict:
             return {**base, "status": c.fetch_error}
         if max_chars and len(c.target_text) > max_chars:
             return {**base, "status": "skipped_large", "target_chars": len(c.target_text)}
-        resp = llm.complete(_SYSTEM, _prompt(c), temperature=0.0, max_tokens=8192)
+        rw = rewrite(c, row["idents"], cl=cl, max_rounds=rounds)
     except Exception as e:
         return {**base, "status": "exc", "error": str(e)[:200]}
 
-    patched = _extract_yaml(resp.get("text", ""))
+    patched = rw["patched"]
+    tokens = {"rounds": rw["rounds"], "input_tokens": rw["input_tokens"],
+              "output_tokens": rw["output_tokens"]}
     if not patched:
         return {**base, "status": "ok", "parseable": False, "llm_accepted": False,
                 "new_pins": 0, "pin_correct": 0, "pin_wrong_version": 0, "pin_fabricated": 0,
-                "input_tokens": resp.get("input_tokens", 0),
-                "output_tokens": resp.get("output_tokens", 0)}
+                **tokens}
 
-    # Classify each action SHA the model NEWLY introduced (was a tag on the
-    # target, now a 40-hex SHA). Correct = matches what the target's OWN ref
-    # resolves to (the backport-safe pin). wrong_version = a real SHA but not the
-    # target's ref (e.g. master's SHA copied -> silent upgrade). fabricated = no
-    # such commit in the action repo. WORKFLOWBP's pin() is correct by design.
-    tgt_ref = {m.group(1): m.group(2)
-               for m in re.finditer(r"uses:\s*([^\s@#]+)@([^\s#]+)", c.target_text)}
-    new_pins = _pins(patched) - _pins(c.target_text)
-    correct = wrong = fab = 0
-    for action, psha in new_pins:
-        try:
-            exists = cl.get_commit(action, psha) is not None
-        except Exception:
-            exists = False
-        if not exists:
-            fab += 1
-            continue
-        ref = tgt_ref.get(action)
-        csha = None
-        if ref:
-            try:
-                cm = cl.get_commit(action, ref)
-                csha = (cm or {}).get("sha")
-            except Exception:
-                csha = None
-        if csha and csha.lower() == psha:
-            correct += 1
-        else:
-            wrong += 1
+    st = Counter(_classify_pins(cl, c.target_text, patched).values())
     accepted = _judge(c.target_text, patched, row["idents"])
     return {**base, "status": "ok", "parseable": True, "llm_accepted": accepted,
-            "new_pins": len(new_pins), "pin_correct": correct,
-            "pin_wrong_version": wrong, "pin_fabricated": fab,
-            "input_tokens": resp.get("input_tokens", 0),
-            "output_tokens": resp.get("output_tokens", 0)}
+            "new_pins": sum(st.values()), "pin_correct": st["correct"],
+            "pin_wrong_version": st["wrong_version"], "pin_fabricated": st["fabricated"],
+            **tokens}
 
 
 # ---------- sampling + driver ----------------------------------------------
@@ -243,6 +315,8 @@ def report(rows_path: Path) -> str:
     if toks:
         out.append(f"avg tokens/case: in={sum(r.get('input_tokens',0) for r in toks)/len(toks):.0f} "
                    f"out={sum(r.get('output_tokens',0) for r in toks)/len(toks):.0f}")
+        out.append(f"avg rounds/case: {sum(r.get('rounds', 1) for r in toks)/len(toks):.2f} "
+                   "(rows without `rounds` predate the multi-round loop: 1 call each)")
     return "\n".join(out)
 
 
@@ -260,6 +334,8 @@ def main() -> int:
                          "full_backport --llm-cases so both run on identical cases")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--rounds", type=int, default=3,
+                    help="max rewrite rounds per case (feedback after a rejected round)")
     ap.add_argument("--max-chars", type=int, default=16000,
                     help="skip targets larger than this (full-file regen impractical)")
     ap.add_argument("--out-dir", default=str(OUT))
@@ -283,7 +359,7 @@ def main() -> int:
         lock = threading.Lock()
         n = [0]
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = [ex.submit(process, r, args.max_chars) for r in todo]
+            futs = [ex.submit(process, r, args.max_chars, args.rounds) for r in todo]
             for fut in as_completed(futs):
                 with lock:
                     jsonl_append(rows_path, fut.result())

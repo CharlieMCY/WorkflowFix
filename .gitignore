@@ -25,3 +25,5 @@ llm_full_rows.jsonl
 baseline_full_rows.jsonl
 *.log
 neuro_eval/llm_patches/
+
+issues_drafts/

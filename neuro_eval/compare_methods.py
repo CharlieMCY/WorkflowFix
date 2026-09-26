@@ -17,7 +17,7 @@ from collections import defaultdict
 CLASSES = ("surgical", "partial", "restructure", "no_security_edit")
 # pureLLM_valid folds the SHA check INTO acceptance: a fabricated SHA passes
 # zizmor (it only checks 40-hex shape) but breaks at runtime, so it must not count.
-COLS = ("symbolic", "combined", "pureLLM_z", "pureLLM_valid", "copy_paste", "dependabot")
+COLS = ("symbolic", "combined", "pureLLM_valid", "copy_paste", "dependabot", "zizmor_fix")
 
 
 def load(p):
@@ -37,17 +37,22 @@ def main():
     ap.add_argument("--sample", default="output/full/llm_sample.jsonl")
     ap.add_argument("--baselines", default="output/full/baselines/baseline_rows.jsonl")
     ap.add_argument("--llm", default="output/full/llm_experiments/rows.jsonl")
+    ap.add_argument("--zizmorfix", default="output/full/baseline_zizmorfix/rows.jsonl")
     args = ap.parse_args()
 
     sample = {key(r): r["klass"] for r in load(args.sample)}
-    bl = {key(r): r for r in load(args.baselines)
-          if r.get("status") == "ok" and key(r) in sample}
+    # keep ALL in-sample baseline rows (not just ok): a baseline fetch_exc means
+    # cp/dependabot produced no fix -> count it as a failure, not an exclusion.
+    bl = {key(r): r for r in load(args.baselines) if key(r) in sample}
     lm = {key(r): r for r in load(args.llm)
           if r.get("status") == "ok" and key(r) in sample}
-    inter = set(bl) & set(lm)
+    zfix = {key(r): bool(r.get("zfix_accepted"))
+            for r in load(args.zizmorfix) if key(r) in sample and r.get("status") == "ok"}
+    inter = set(lm)                       # universe = the 12k the LLM completed
 
-    print(f"sample={len(sample)}  cp/dep ok in-sample={len(bl)}  "
-          f"LLM done ok={len(lm)}  five-way intersection={len(inter)}\n")
+    print(f"sample={len(sample)}  baseline rows in-sample={len(bl)} "
+          f"(cp/dep fetch-fail counted as failure)  LLM ok={len(lm)}  "
+          f"zizmor-fix ok={len(zfix)}  N={len(inter)}\n")
 
     def _bl_valid(k):     # route-level AND no fabricated SHA (actually runs)
         r = lm[k]
@@ -62,8 +67,9 @@ def main():
         "combined": lambda k: lm[k].get("combined_accepted"),
         "pureLLM_z": lambda k: lm[k].get("bl_accepted"),   # zizmor-lenient (old)
         "pureLLM_valid": _bl_valid,
-        "copy_paste": lambda k: bl[k].get("cp_accepted"),
-        "dependabot": lambda k: bl[k].get("dep_accepted"),
+        "copy_paste": lambda k: bl.get(k, {}).get("cp_accepted"),   # fetch_exc -> None -> fail
+        "dependabot": lambda k: bl.get(k, {}).get("dep_accepted"),
+        "zizmor_fix": lambda k: zfix.get(k, False),
     }
     per = defaultdict(lambda: defaultdict(int))
     cnt = defaultdict(int)
@@ -74,7 +80,7 @@ def main():
             per[kl][c] += int(bool(getters[c](k)))
 
     hdr = f"{'class':16}{'n':>6}" + "".join(f"{c:>12}" for c in COLS)
-    print("== five-way, identical cases (intersection) ==")
+    print("== six-way on N=12,000 (cp/dep fetch-fail counted as failure) ==")
     print(hdr)
     tot = defaultdict(int)
     tn = 0

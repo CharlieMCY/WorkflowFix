@@ -9,6 +9,9 @@ single pass:
                    whose prompt embeds the previous round's counterexamples.
   3. baseline   -- ALWAYS: ask the LLM to rewrite the whole target file directly
                    (the naive pure-LLM baseline) + grade + SHA-pin correctness.
+                   Up to --bl-rounds rounds (default 3, same budget as the
+                   fallback): a rejected rewrite is re-sent with the previous
+                   output and the verifier's feedback (baseline_llm.rewrite).
 
 So one fallback and one baseline run back-to-back per case (not two separate full
 passes), and a single resumable rows file keeps both experiments in lock-step.
@@ -29,7 +32,6 @@ Usage:
 import argparse
 import json
 import os
-import re
 import sys
 import threading
 from collections import Counter, defaultdict
@@ -48,9 +50,8 @@ from backport_ir.neuro_backport import (  # noqa: E402
     compile_case, evaluate_symbolic, fetch_case, make_client, oracle_summary,
 )
 from backport_ir.pipeline import make_github_resolver, make_image_resolver  # noqa: E402
-from common import llm  # noqa: E402
 from common.cache import jsonl_already_done, jsonl_append  # noqa: E402
-from neuro_eval.baseline_llm import _SYSTEM, _extract_yaml, _judge, _pins, _prompt  # noqa: E402
+from neuro_eval.baseline_llm import _classify_pins, _judge, rewrite  # noqa: E402
 
 CLASSES = ("surgical", "partial", "restructure", "no_security_edit")
 _ACCEPT_KEYS = ("zizmor_local", "actionlint", "permissions", "minimality")
@@ -82,32 +83,12 @@ def _key(r: dict) -> tuple:
 def _pin_correctness(cl, target_before: str, patched: str):
     """(new, correct, wrong_version, fabricated) for action SHAs the LLM newly
     introduced vs the target's own ref. Same metric as baseline_llm."""
-    tgt_ref = {m.group(1): m.group(2)
-               for m in re.finditer(r"uses:\s*([^\s@#]+)@([^\s#]+)", target_before)}
-    new = _pins(patched) - _pins(target_before)
-    correct = wrong = fab = 0
-    for action, psha in new:
-        try:
-            exists = cl.get_commit(action, psha) is not None
-        except Exception:
-            exists = False
-        if not exists:
-            fab += 1
-            continue
-        ref = tgt_ref.get(action)
-        csha = None
-        if ref:
-            try:
-                cm = cl.get_commit(action, ref)
-                csha = (cm or {}).get("sha")
-            except Exception:
-                csha = None
-        correct += int(bool(csha) and csha.lower() == psha)
-        wrong += int(not (bool(csha) and csha.lower() == psha))
-    return len(new), correct, wrong, fab
+    st = Counter(_classify_pins(cl, target_before, patched).values())
+    return sum(st.values()), st["correct"], st["wrong_version"], st["fabricated"]
 
 
-def process(row: dict, rounds: int, max_chars: int, max_tokens: int = 8192) -> dict:
+def process(row: dict, rounds: int, max_chars: int, max_tokens: int = 8192,
+            bl_rounds: int = 3) -> dict:
     repo, sha, branch, path = row["repository"], row["commit_hash"], row["branch"], row["file"]
     base = {"repository": repo, "commit_hash": sha, "branch": branch,
             "file": path, "idents": row["idents"], "klass": row["klass"]}
@@ -123,7 +104,8 @@ def process(row: dict, rounds: int, max_chars: int, max_tokens: int = 8192) -> d
 
     out = {**base, "status": "ok"}
     res = None        # fallback LLMResult (when symbolic failed)
-    patched = None    # pure-LLM rewritten YAML
+    patched = None    # pure-LLM rewritten YAML (last round)
+    rw = None         # pure-LLM rewrite() result
     try:
         # 1) symbolic
         prog = compile_case(c)
@@ -144,9 +126,10 @@ def process(row: dict, rounds: int, max_chars: int, max_tokens: int = 8192) -> d
         out["combined_accepted"] = sym_acc or bool(out.get("fallback_accepted"))
 
         # 3) pure-LLM baseline (always)
-        resp = llm.complete(_SYSTEM, _prompt(c), temperature=0.0, max_tokens=max_tokens)
-        patched = _extract_yaml(resp.get("text", ""))
-        out.update(bl_in=resp.get("input_tokens", 0), bl_out=resp.get("output_tokens", 0))
+        rw = rewrite(c, row["idents"], cl=cl, max_rounds=bl_rounds, max_tokens=max_tokens)
+        patched = rw["patched"]
+        out.update(bl_rounds=rw["rounds"], bl_in=rw["input_tokens"],
+                   bl_out=rw["output_tokens"])
         if not patched:
             out.update(bl_parseable=False, bl_accepted=False,
                        bl_new_pins=0, bl_correct=0, bl_wrong=0, bl_fab=0)
@@ -175,6 +158,10 @@ def process(row: dict, rounds: int, max_chars: int, max_tokens: int = 8192) -> d
                     indent=2, ensure_ascii=False))
             if patched:
                 d.joinpath("baseline_patched.yml").write_text(patched)
+            if rw is not None:
+                d.joinpath("baseline_meta.json").write_text(json.dumps(
+                    {"accepted": out.get("bl_accepted"), "rounds": rw["rounds"],
+                     "history": rw["history"]}, indent=2, ensure_ascii=False))
             d.joinpath("meta.json").write_text(json.dumps(out, indent=2, ensure_ascii=False))
         except Exception:
             pass
@@ -243,6 +230,8 @@ def report(rows_path: Path) -> str:
                f"out={sum(r.get('fb_out',0) for r in ok)/max(1,sum(1 for r in ok if r.get('fallback_run'))):.0f} | "
                f"baseline in={sum(r.get('bl_in',0) for r in toks)/len(toks):.0f} "
                f"out={sum(r.get('bl_out',0) for r in toks)/len(toks):.0f}")
+    out.append(f"baseline rounds/case: {sum(r.get('bl_rounds', 1) for r in toks)/len(toks):.2f} "
+               "(rows without bl_rounds predate the multi-round loop: 1 call each)")
     return "\n".join(out)
 
 
@@ -252,6 +241,8 @@ def main() -> int:
     ap.add_argument("--out-dir", default="output/full/llm_experiments")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=3, help="fallback CEGIS rounds")
+    ap.add_argument("--bl-rounds", type=int, default=3,
+                    help="pure-LLM baseline rewrite rounds (feedback after a rejected round)")
     ap.add_argument("--max-chars", type=int, default=16000)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-artifacts", action="store_true",
@@ -291,7 +282,8 @@ def main() -> int:
                 r = next(it, None)
                 if r is None:
                     break
-                inflight.add(ex.submit(process, r, args.rounds, args.max_chars))
+                inflight.add(ex.submit(process, r, args.rounds, args.max_chars,
+                                              bl_rounds=args.bl_rounds))
             while inflight:
                 ready, inflight = wait(inflight, return_when=FIRST_COMPLETED)
                 for fut in ready:
@@ -311,7 +303,8 @@ def main() -> int:
                         r = next(it, None)
                         if r is None:
                             break
-                        inflight.add(ex.submit(process, r, args.rounds, args.max_chars))
+                        inflight.add(ex.submit(process, r, args.rounds, args.max_chars,
+                                              bl_rounds=args.bl_rounds))
         if stopping:
             print(f"  stopped on token budget after {n[0]} new rows this run; "
                   f"re-run the same command to resume", flush=True)

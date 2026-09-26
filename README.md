@@ -37,6 +37,37 @@ cp .env.example .env    # set GITHUB_TOKEN (or a pool GITHUB_TOKENS=t1,t2,...) a
 MSR'24): `workflows.csv` and the `workflows/` blob directory. All outputs are
 written to `output/full/` (`DATASET_TAG=full`).
 
+**Release-branch audit data (`data/`).** The results of the release-branch
+audit are included, so the RQ1–RQ2 reports in Section 2 can be run without
+GitHub access:
+
+```bash
+mkdir -p output/full/backport_gaps
+gunzip -c data/gaps.jsonl.gz              > output/full/backport_gaps/gaps.jsonl
+gunzip -c data/gaps_with_history.jsonl.gz > output/full/backport_gaps/gaps_with_history.jsonl
+```
+
+Each file has one JSON line per default-branch security fix (70,566 lines;
+`status` is `ok` for the 69,808 fixes whose release branches were audited):
+
+| Field | Meaning |
+|---|---|
+| `repository`, `commit_hash`, `default_branch` | The project and the fixing commit on its default branch |
+| `V_fixed_idents` | zizmor rules the fix removed |
+| `target_files` | Workflow files the fix changed |
+| `gap_branches` / `already_fixed_branches` / `inapplicable_branches` | Release branches where the weakness is still present / already absent / the file does not exist |
+| `…branches[].branch_head_sha` | Commit SHA of the branch HEAD at audit time (the point-in-time snapshot that was scanned) |
+| `…branches[].files[]` | Per file: `file_path`, `status` (`ok`, `absent`, `scan_failed`) and, for gap branches, `V_present_idents` |
+
+`gaps_with_history.jsonl` adds the history walk of every already-fixed branch:
+
+| Field | Meaning |
+|---|---|
+| `already_fixed_branches[].backport_status` | `confirmed_backport` (the issue was present on the branch and later removed), `never_had_it`, `inconclusive`, or `timed_out` |
+| `already_fixed_branches[].lag_days` | Days between the default-branch fix and its removal on the branch: > 1 is a plausible backport, within ±1 same-day, < −1 an independent prior fix |
+| `…history_classifications[].backport_commit_sha`, `backport_commit_date` | The branch commit where the issue disappeared |
+| `master_commit_date`, `record_timed_out`, `record_duration_s` | Date of the default-branch fix; whether the history budget was exceeded |
+
 ## 2. Empirical study (RQ1–RQ3)
 
 ```bash

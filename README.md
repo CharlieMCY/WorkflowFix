@@ -47,8 +47,7 @@ gunzip -c data/gaps.jsonl.gz              > output/full/backport_gaps/gaps.jsonl
 gunzip -c data/gaps_with_history.jsonl.gz > output/full/backport_gaps/gaps_with_history.jsonl
 ```
 
-Each file has one JSON line per default-branch security fix (70,566 lines;
-`status` is `ok` for the 69,808 fixes whose release branches were audited):
+Each file has one JSON line per default-branch security fix:
 
 | Field | Meaning |
 |---|---|

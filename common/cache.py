@@ -236,9 +236,17 @@ def jsonl_already_done(path: Path, key_fn: Callable[[dict], tuple]) -> set[tuple
 
 def jsonl_append(path: Path, row: dict) -> None:
     """Append one row to a JSONL file, flushing immediately so a crash
-    mid-pipeline doesn't lose recent work."""
+    mid-pipeline doesn't lose recent work.
+
+    `default=str` makes the writer robust to YAML-derived values that
+    aren't natively JSON-serializable — most importantly `datetime.date`
+    / `datetime.datetime`, which `yaml.safe_load` produces from bare date
+    scalars in a workflow (e.g. an unquoted `on: 2021-10-05`). Without
+    this, such a value crashes the per-commit write and the whole commit
+    is lost as an `exception`. Coercing to the ISO string is exactly the
+    behaviour the diff/finding consumers expect."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(row, ensure_ascii=False))
+        fp.write(json.dumps(row, ensure_ascii=False, default=str))
         fp.write("\n")
         fp.flush()

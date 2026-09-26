@@ -1,11 +1,19 @@
 """Minimal GitHub REST client for the operations we need.
 
-Authenticated calls share a 5000/hr rate limit. We log rate-limit headers and
-back off briefly on transient errors. Only public-read endpoints are used.
+Single-token mode: 5000 GET/hr per PAT. When constructed with multiple
+tokens (the streaming driver does this), the client round-robins requests
+across an internal pool of `requests.Session`s — one per token — and
+parks any session that hits the 403 rate-limit response in a cooldown
+list until its quota resets. Effective ceiling is therefore N × 5000/hr
+for N tokens, modulo GitHub's per-account secondary rate limit (which is
+the practical reason multi-account tokens scale further than multi-PAT-
+single-account tokens). Only public-read endpoints are used; we log
+rate-limit headers and back off briefly on transient errors.
 """
 from __future__ import annotations
 
 import base64
+import threading
 import time
 from typing import Iterator
 
@@ -24,30 +32,71 @@ class GitHubError(RuntimeError):
     pass
 
 
+def _make_session(token: str) -> requests.Session:
+    """Build a requests.Session authenticated for one PAT, with the usual
+    transient-retry adapter."""
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": _USER_AGENT,
+    })
+    retry = Retry(
+        total=3, connect=3, read=2, backoff_factor=1.0,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry,
+                          pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
 class GitHubClient:
-    def __init__(self, token: str):
-        self._session = requests.Session()
-        self._session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": _USER_AGENT,
-        })
-        # urllib3 Retry: on transient connection errors, drop the broken
-        # pooled connection and reconnect, instead of hanging in poll().
-        retry = Retry(
-            total=3,
-            connect=3,
-            read=2,
-            backoff_factor=1.0,
-            status_forcelist=(500, 502, 503, 504),
-            allowed_methods=("GET",),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=10,
-                              pool_maxsize=10)
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
+    def __init__(self, tokens):
+        """Accepts a single PAT string or a list of PATs.
+
+        With a list, the client round-robins requests across one session
+        per token; rate-limited sessions park in a cooldown set until
+        their `X-RateLimit-Reset` passes, so the other tokens keep
+        serving requests in parallel.
+        """
+        if isinstance(tokens, str):
+            tokens = [tokens]
+        if not tokens:
+            raise ValueError("GitHubClient requires at least one token")
+        self._sessions = [_make_session(t) for t in tokens]
+        self._cooldown_until = [0.0] * len(self._sessions)
+        self._next_idx = 0
+        self._lock = threading.Lock()
+        # back-compat alias for any external code that previously poked at
+        # `client._session` directly
+        self._session = self._sessions[0]
+
+    # --- session picking ------------------------------------------------
+
+    def _pick_session(self) -> tuple[int, requests.Session]:
+        """Return (idx, session) for the next non-cooldown session. If
+        every session is cooled down, sleep until the earliest reset and
+        return that one."""
+        while True:
+            with self._lock:
+                now = time.time()
+                n = len(self._sessions)
+                for offset in range(n):
+                    idx = (self._next_idx + offset) % n
+                    if self._cooldown_until[idx] <= now:
+                        self._next_idx = (idx + 1) % n
+                        return idx, self._sessions[idx]
+                # everything cooled — find earliest reset
+                idx = min(range(n), key=lambda i: self._cooldown_until[i])
+                wait = max(self._cooldown_until[idx] - now, 1.0)
+                # bound the sleep so a misreported reset doesn't stall us
+                wait = min(wait, 120.0)
+            time.sleep(wait)
 
     # --- HTTP -----------------------------------------------------------
 
@@ -55,8 +104,9 @@ class GitHubClient:
              allow_404: bool = False, allow_422: bool = False) -> requests.Response:
         url = path if path.startswith("http") else f"{_BASE}{path}"
         for attempt in range(4):
+            idx, session = self._pick_session()
             try:
-                r = self._session.get(url, params=params, timeout=_TIMEOUT)
+                r = session.get(url, params=params, timeout=_TIMEOUT)
             except (requests.ConnectionError, requests.Timeout) as e:
                 # urllib3 Retry already retried adapter-level; this is a
                 # final fallback so a stubborn network blip doesn't crash.
@@ -71,9 +121,13 @@ class GitHubClient:
             if r.status_code == 422 and allow_422:
                 return r
             if r.status_code == 403 and "rate limit" in r.text.lower():
+                # Park THIS session until its quota resets; loop will pick
+                # the next available session on the next attempt.
                 reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
-                wait = max(reset - int(time.time()), 1)
-                time.sleep(min(wait, 120))
+                with self._lock:
+                    self._cooldown_until[idx] = max(
+                        self._cooldown_until[idx], float(reset)
+                    )
                 continue
             if r.status_code in (502, 503, 504):
                 time.sleep(2 ** attempt)

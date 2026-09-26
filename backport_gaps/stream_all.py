@@ -39,7 +39,7 @@ from pattern_miner.extract_diff import diff_workflow_versions
 from pattern_miner.fix_classify import classify
 from pattern_miner.scan import diff_findings, scan_bytes
 
-from .config import get_github_token
+from .config import get_github_tokens
 from .gaps import find_gap_for_commit
 from .github import GitHubClient
 from .history import classify_record as classify_history_record
@@ -575,7 +575,10 @@ def run(
         # master_date_cache used by classify_history_record across workers
         "_master_date_cache": {},
     }
-    client = GitHubClient(get_github_token())
+    tokens = get_github_tokens()
+    client = GitHubClient(tokens)
+    print(f"GitHub client: {len(tokens)} token(s) "
+          f"({'round-robin enabled' if len(tokens) > 1 else 'single-token mode'})")
 
     # Mirror 50k's gaps_with_history.jsonl on first run so 05 can read the
     # combined dataset immediately. The bulk import already mirrored

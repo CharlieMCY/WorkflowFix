@@ -81,7 +81,9 @@ class FixVerdict:
 def _safe_load(text: str) -> Any:
     try:
         return yaml.safe_load(text)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, ValueError):
+        # ValueError escapes safe_load on out-of-range implicit scalars
+        # (e.g. `0000-00-00` -> date(0,0,0)); treat as unparseable.
         return None
 
 
